@@ -1,0 +1,23 @@
+{
+  "duckmail_api_key": "",
+  "cloudflare_api_base": "https://temp-mail.example.com",
+  "cloudflare_api_key": "",
+  "cloudflare_auth_mode": "none",
+  "cloudflare_custom_auth": "",
+  "cloudflare_path_domains": "/api/domains",
+  "cloudflare_path_accounts": "/api/new_address",
+  "cloudflare_path_token": "/api/token",
+  "cloudflare_path_messages": "/api/mails",
+  "proxy": "",
+  "enable_nsfw": true,
+  "register_count": 1,
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+  "cpa_auto_add": false,
+  "cpa_auth_dir": "",
+  "cpa_remote_url": "",
+  "cpa_management_key": "",
+  "defaultDomains": "example.com",
+  "email_provider": "cloudflare",
+  "yyds_api_key": "",
+  "yyds_jwt": ""
+}
