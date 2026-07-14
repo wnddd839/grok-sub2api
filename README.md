@@ -1,15 +1,18 @@
 <div align="center">
 
-[![Grok Register — 注册即入库 CLIProxyAPI](assets/banner.png)](https://github.com/Git-creat7/grokRegister-cpa)
+# grok-sub2api
 
-批量注册 Grok 账号，注册成功后自动把 OAuth 凭证写入 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI)：支持本地 auth 目录热加载，也支持 Management API 远程上传。
+批量注册 Grok 账号，自动导出为 [Sub2API](https://github.com/Wei-Shaw/sub2api) 可导入的 OAuth 数据包；可选同步到远程 Sub2API，也兼容 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI)。
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB.svg" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/Interface-GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
-  <img src="https://img.shields.io/badge/Output-CLIProxyAPI-orange.svg" alt="CLIProxyAPI">
+  <img src="https://img.shields.io/badge/GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
+  <img src="https://img.shields.io/badge/Sub2API-oauth%20import-orange.svg" alt="Sub2API">
+  <img src="https://img.shields.io/badge/xAI-Grok-black.svg" alt="Grok">
 </p>
+
+[仓库地址](https://github.com/wnddd839/grok-sub2api) · [Sub2API](https://github.com/Wei-Shaw/sub2api) · [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 
 </div>
 
@@ -17,79 +20,134 @@
 
 > 仅用于自动化流程研究、测试环境验证和个人学习。请遵守目标网站服务条款、当地法律法规与第三方服务限制。
 
-## 核心流程
+## 它做什么
 
 ```text
-打开注册页 → 创建临时邮箱 → 收验证码 → 填资料 / 过人机验证
-   → 拿到 SSO cookie → device-flow 换 OAuth token
-   → 本地写入 cpa_auth_dir  和/或  POST 远程 CPA Management API
-   → CPA 热加载，立即可用
+打开注册页 → 临时邮箱收验证码 → 填资料 / 过人机验证
+    → 拿到 SSO → device-flow 换 access_token / refresh_token
+    → 验活（可选）→ 按批次写出 Sub2API 导入包
+    →（可选）远程创建到 Sub2API / 写入 CPA
 ```
 
-## 功能
+一次跑完，得到可直接在 Sub2API 后台「导入数据」的 `sub2api-data` JSON 包。
 
-- 注册成功后自动入库 CPA（本地目录 / 远程 Management API，可同时开）
-- GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
-- Chromium/Chrome 自动处理 Turnstile
-- DuckMail / YYDS / Cloudflare 临时邮箱
-- 注册后可选开启 NSFW
-- 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
-- CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
+## 功能亮点
+
+- **Sub2API 一等公民**：官方导出包格式（`type: sub2api-data`），按批次分包（默认 20，可配）
+- **并行验活**：换 token / `/models` 验活 / 写包不阻塞浏览器注册主循环；验活失败不写包
+- **过期不停调度**：导出账号默认 `auto_pause_on_expired: false`，避免 access 到期后无法触发 refresh
+- **GUI + CLI**：界面改配置；也可用 `启动注册机.bat` / CLI
+- **临时邮箱**：Cloudflare Temp Mail / DuckMail / YYDS
+- **可选 CPA**：本地 auth 目录热加载，或 Management API 远程上传
+- **稳定性**：浏览器重启、卡住重试、验证码失败换邮箱、`Ctrl+C` 安全停止
 
 ## 环境要求
 
-- Python 3.9+
+- Python 3.9+（建议 3.12 / 3.13；避免过新的实验版本）
 - Google Chrome 或 Chromium
-- 可用的 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-- 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（device-flow 换 token 需要）
+- 能访问注册页、临时邮箱 API、`auth.x.ai`（device-flow 换 token）
+- 使用 Sub2API 时：本机或远程 [Sub2API](https://github.com/Wei-Shaw/sub2api)（建议较新版本，Grok OAuth 需支持 CLI version 头）
 
-## 安装
+## 快速开始
 
 ```bash
-git clone https://github.com/Git-creat7/grokRegister-cpa.git
-cd grokRegister-cpa
+git clone https://github.com/wnddd839/grok-sub2api.git
+cd grok-sub2api
+
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Linux / macOS
+# source .venv/bin/activate
+
 pip install -r requirements.txt
 cp config.example.json config.json
 ```
 
-编辑 `config.json` 后运行。
+编辑 `config.json`（**不要提交**），最小 Sub2API 本地导出示例：
 
-## 配置
+```json
+{
+  "email_provider": "cloudflare",
+  "cloudflare_api_base": "https://你的临时邮箱API",
+  "cloudflare_auth_mode": "none",
+  "defaultDomains": "你的收信域名.com",
+  "register_count": 10,
+  "proxy": "http://127.0.0.1:7890",
+  "sub2api_auto_add": true,
+  "sub2api_dir": "./sub2api_out",
+  "sub2api_batch_size": 10,
+  "sub2api_verify": true,
+  "sub2api_verify_workers": 3
+}
+```
+
+运行：
+
+```bash
+# Windows 双击亦可
+启动注册机.bat
+
+# 或
+python grok_register_ttk.py          # GUI
+python grok_register_ttk.py cli      # CLI（仍会开浏览器）
+```
+
+成功后在 `sub2api_out/batch_时间戳/` 下得到：
+
+```text
+sub2api_accounts_001.json
+sub2api_accounts_002.json
+...
+```
+
+到 Sub2API 管理后台 → **导入数据**，选中上述 JSON 即可。
+
+## 配置说明
+
+### Sub2API（主推）
 
 | 配置项 | 说明 |
 | --- | --- |
-| `cpa_auto_add` | 是否开启 CPA 自动入库 |
-| `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
-| `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
-| `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` |
-| `register_count` | 目标注册数量 |
-| `proxy` | 代理；device-flow 换 token 也走此代理 |
-| `enable_nsfw` | 注册后是否尝试开启 NSFW |
-| `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
-| `cloudflare_api_key` | 默认匿名模式留空；admin 模式填 `ADMIN_PASSWORD` |
-| `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
-| `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
-| `cloudflare_path_*` | domains / accounts / token / messages 路径 |
-| `defaultDomains` | Cloudflare 默认收信域名 |
+| `sub2api_auto_add` | 开启后注册成功自动导出 |
+| `sub2api_dir` | 本地导入包输出目录 |
+| `sub2api_batch_size` | 每个 JSON 包账号数（默认 20） |
+| `sub2api_verify` | 写包前用 CLI 风格请求验活 |
+| `sub2api_verify_workers` | 并行验活线程数 |
+| `sub2api_url` | 远程 Sub2API 根地址（可选） |
+| `sub2api_token` | 远程管理员 Bearer Token（可选；需有效 JWT） |
 
-### Cloudflare 邮箱（默认匿名）
+远程创建走 `POST /api/v1/admin/accounts`，Token 无效会 `401 INVALID_TOKEN`，**不影响本地写包**。
+
+### 邮箱 / 代理 / 通用
+
+| 配置项 | 说明 |
+| --- | --- |
+| `email_provider` | `cloudflare` / `duckmail` / `yyds` |
+| `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
+| `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
+| `cloudflare_api_key` | admin 模式填 `ADMIN_PASSWORD`；匿名留空 |
+| `defaultDomains` | 收信域名，多个用逗号分隔 |
+| `register_count` | 目标注册数量 |
+| `proxy` | HTTP 代理；换 token / 验活也走此代理 |
+| `enable_nsfw` | 注册后尝试开启 NSFW（失败仍会继续导出） |
+
+### Cloudflare 邮箱示例
+
+匿名（默认）：
 
 ```json
 {
   "email_provider": "cloudflare",
   "cloudflare_api_base": "https://你的-worker-api-域名",
-  "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
-  "cloudflare_path_domains": "/api/domains",
   "cloudflare_path_accounts": "/api/new_address",
-  "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
   "defaultDomains": "你的收信域名.com"
 }
 ```
 
-匿名创建失败（例如 Turnstile）时可改 admin 创建：
+Admin 创建（匿名被 Turnstile 拦时）：
 
 ```json
 {
@@ -99,7 +157,7 @@ cp config.example.json config.json
 }
 ```
 
-调试创建接口：
+调试：
 
 ```bash
 python cf_mail_debug.py \
@@ -110,137 +168,77 @@ python cf_mail_debug.py \
   --domain "你的收信域名.com"
 ```
 
-Worker 若配置了全局 `PASSWORDS`，再加：
+### CLIProxyAPI（可选）
 
-```json
-{ "cloudflare_custom_auth": "你的全局访问密码" }
-```
+| 配置项 | 说明 |
+| --- | --- |
+| `cpa_auto_add` | 开启 CPA 入库 |
+| `cpa_auth_dir` | 本地 CPA auth 目录 → `xai-<email>.json` |
+| `cpa_remote_url` | 远程 CPA，如 `http://你的CPA:8317` |
+| `cpa_management_key` | Management API 明文密钥 |
 
-## CPA 自动入库
-
-SSO 不是 CPA 凭据。程序会：
-
-1. 用 SSO 走 device-flow 向 `auth.x.ai` 换 `access_token` / `refresh_token`
-2. 组装 `type=xai` 扁平 auth（`cli-chat-proxy.grok.com`）
-3. 本地：`cpa_auth_dir` → `xai-<email>.json`（CPA 热加载）
-4. 远程：`POST {cpa_remote_url}/v0/management/auth-files?name=...`（需管理密钥）
-
-### 本地目录
-
-```json
-{
-  "cpa_auto_add": true,
-  "cpa_auth_dir": "你的CPA auth目录"
-}
-```
-
-`cpa_auth_dir` 填 CPA 实际监听的 auth 目录路径即可。
-
-### 远程 Management API
-
-```json
-{
-  "cpa_auto_add": true,
-  "cpa_auth_dir": "",
-  "cpa_remote_url": "http://你的CPA地址:8317",
-  "cpa_management_key": "你的管理密钥明文"
-}
-```
-
-要求 CPA：`remote-management.allow-remote` 按访问方式配置；密钥为配置里的明文（启动后配置文件可能被写成 bcrypt，上传仍用明文）。
-
-本地与远程可同时开启。日志前缀：`[CPA]`。
-
-### 独立转换
-
-已有 SSO 时可脱离注册流程：
+## 已有 SSO 时单独转换
 
 ```bash
-# 写本地目录
-python sso_to_auth_json.py --sso sso_list.txt --cpa-auth-dir /path/to/auths
+# 导出 Sub2API 包
+python sso_to_auth_json.py --sso sso_list.txt --sub2api-dir ./sub2api_out
 
-# 上传远程 CPA
+# 上传远程 Sub2API
 python sso_to_auth_json.py --sso sso_list.txt \
-  --cpa-remote-url http://你的CPA地址:8317 \
-  --cpa-management-key '你的管理密钥'
+  --sub2api-url https://你的Sub2API \
+  --sub2api-token '管理员JWT'
 
-# 单个 cookie + 代理
-python sso_to_auth_json.py --sso-cookie 'eyJ...' \
-  --cpa-auth-dir ./auths \
-  --proxy http://127.0.0.1:7890
+# 写 CPA 本地目录
+python sso_to_auth_json.py --sso sso_list.txt --cpa-auth-dir /path/to/auths
 ```
 
 `sso_list.txt`：一行一个 SSO，或 `邮箱----密码----sso`。
 
-## 运行
+## 输出与安全
 
-### CLI
+| 路径 | 内容 | 是否提交 |
+| --- | --- | --- |
+| `sub2api_out/` | Sub2API 导入包（含 token） | 否 |
+| `auth_out/` | CPA 扁平凭证 | 否 |
+| `accounts_*.txt` | 邮箱 / 密码 / SSO | 否 |
+| `mail_credentials.txt` | 临时邮箱凭证 | 否 |
+| `config.json` | 本地密钥与地址 | 否 |
+| `config.example.json` | 示例配置 | 是 |
 
-```bash
-python grok_register_ttk.py cli
-```
-
-提示后输入 `start`。  
-`Ctrl+C` 一次：当前账号收尾后停止；清理浏览器时不会因二次中断刷 traceback。再按一次强制退出。
-
-### GUI
-
-```bash
-python grok_register_ttk.py
-```
-
-可在界面里改 CPA 开关、auth 目录、远程地址与管理密钥。
-
-## 输出文件
-
-| 文件 | 内容 |
-| --- | --- |
-| `accounts_*.txt` | 邮箱、密码、SSO |
-| `mail_credentials.txt` | 临时邮箱凭证 |
-
-均含敏感信息，已在 `.gitignore` 中忽略。`config.json` 也不提交，请用 `config.example.json` 复制。
-
-## 稳定性
-
-- 每账号结束后重启浏览器
-- 每成功 5 个账号做一次内存清理
-- 邮箱提交后确认页面前进，避免空等验证码
-- 未收到验证码时换邮箱重试
-- 最终页卡住时重试当前账号
+请只提交 `config.example.json`，用复制出来的 `config.json` 填真实值。
 
 ## 常见问题
 
-**CPA 没出现新账号**  
-检查 `cpa_auto_add`、`cpa_auth_dir` 或 `cpa_remote_url` + `cpa_management_key`；看 `[CPA]` 日志是否换 token / 上传成功；本机/服务器能否访问 `auth.x.ai`。
+**注册成功了，但文件夹没有 JSON**  
+`[+] 注册成功` 只表示拿到 SSO。若日志出现 `device-flow 换 token 失败，跳过`，说明连不上 `auth.x.ai`（代理/超时）。没有 OAuth token 就不会写 Sub2API 包。
 
-**远程上传失败**  
-确认 CPA 管理 API 已启用、密钥明文正确；远程访问需 `allow-remote: true`。可用：
+**导入 Sub2API 后账号到期就停用**  
+请确认导入包里 `auto_pause_on_expired` 为 `false`（本仓库默认已关闭）。旧账号需在面板手动关掉「过期自动暂停」。
 
-```bash
-curl -H "Authorization: Bearer <管理密钥>" \
-  http://你的CPA地址:8317/v0/management/auth-files
-```
+**远程 Sub2API 401 INVALID_TOKEN**  
+管理员 Token 无效或不是 JWT；本地写包仍会成功，修好 Token 后再推。
 
-**CLI 为什么还开浏览器**  
-CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
+**验活失败 / 426 CLI version**  
+升级 Sub2API 到支持 Grok CLI version 头的版本；本仓库验活会带 CLI 风格请求头。
 
-**NSFW 失败**  
-常见为 Cloudflare 拦截。账号仍会保存并入库 CPA。
+**NSFW 超时**  
+不影响账号导出；多为上游接口超时或网络问题。
 
-**国内服务器调模型超时**  
-入库成功只说明凭证到了 CPA；调用上游 `cli-chat-proxy.grok.com` 还需服务器出网可达（或配置 CPA `proxy-url`）。
+**curl / OpenSSL TLS 报错（创建邮箱）**  
+多为本机 `curl_cffi` 与 OpenSSL 冲突或代理干扰。可重装 `curl_cffi`、关掉异常代理后再试。
 
 ## 目录结构
 
 ```text
 .
-├── grok_register_ttk.py      # 主程序（GUI / CLI + CPA 入库）
-├── sso_to_auth_json.py       # SSO → CPA 转换（可独立运行）
-├── cf_mail_debug.py          # Cloudflare 邮箱调试
+├── grok_register_ttk.py       # 主程序 GUI / CLI
+├── sso_to_auth_json.py        # SSO → Sub2API / CPA
+├── cf_mail_debug.py           # Cloudflare 邮箱调试
+├── 启动注册机.bat             # Windows 一键启动
 ├── config.example.json
 ├── requirements.txt
 ├── tests/
-└── assets/banner.png
+└── assets/
 ```
 
 ## License
@@ -249,4 +247,6 @@ CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 
 ## Acknowledgments
 
-Thanks to [linux.do](https://linux.do) and [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
+- [Sub2API](https://github.com/Wei-Shaw/sub2api)
+- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+- [linux.do](https://linux.do)

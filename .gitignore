@@ -1,33 +1,65 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 .Python
 .venv/
 venv/
 env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-accounts_*.txt
-mail_credentials.txt
-*.txt
-!requirements.txt
-
+# 本地配置（含 API Key / Token / 域名）— 只提交 config.example.json
 config.json
 config.local.json
 config.local.*
 *.bak
+.env
+.env.*
 
-# 真实账号凭证 / OAuth token 输出，禁止提交
+# 账号 / 凭证 / OAuth 输出 — 禁止提交
+accounts_*.txt
+mail_credentials.txt
+sso_list.txt
+sso_out/
+token.json
 auth_out.json
 auth_out/
+auth_out_grok_cli/
 auth_merged.json
 *.auth.json
-sso_list.txt
-token.json
+sub2api_out/
+cpa_out/
+cpa_auth/
+*.sso
+*.jwt
 
+# 通用文本日志（保留依赖清单）
+*.txt
+!requirements.txt
 *.log
+
+# 本地一次性调试脚本
+_compare_cpa.py
+_compare_*.py
+
+# 编辑器 / 系统
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
+.cursor/
+*.swp
+*.swo
+
+# 浏览器自动化临时资料
 DrissionPage/
 autoPortData/
+**/autoPortData/
+tmp/
+temp/
+*.tmp

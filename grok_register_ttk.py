@@ -63,10 +63,23 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
+    # Sub2API：注册成功后按批次写出导入包 / 可选远程创建账号
+    "sub2api_auto_add": False,
+    "sub2api_dir": "",
+    "sub2api_url": "",
+    "sub2api_token": "",
+    "sub2api_batch_size": 20,
+    "sub2api_verify": True,
+    "sub2api_verify_workers": 3,
 }
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_sub2api_batch_writer = None
+_sub2api_io_lock = threading.Lock()
+_sub2api_executor = None
+_sub2api_futures = []
+_sub2api_futures_lock = threading.Lock()
 
 
 class RegistrationCancelled(Exception):
@@ -291,11 +304,76 @@ def _normalize_sso_token(raw_token):
     return token
 
 
+def begin_sub2api_batch_session(log_callback=None):
+    """为本次注册任务创建独立的 Sub2API 分包目录，并启动并行验活线程池。"""
+    global _sub2api_batch_writer, _sub2api_executor, _sub2api_futures
+    wait_sub2api_pending(log_callback=log_callback)
+    _sub2api_batch_writer = None
+    if not config.get("sub2api_auto_add", False):
+        return None
+    out_dir = str(config.get("sub2api_dir", "") or "").strip()
+    remote_url = str(config.get("sub2api_url", "") or "").strip()
+    if not out_dir and not remote_url:
+        return None
+    try:
+        batch_size = max(int(config.get("sub2api_batch_size", 20) or 20), 1)
+    except (TypeError, ValueError):
+        batch_size = 20
+    try:
+        workers = max(int(config.get("sub2api_verify_workers", 3) or 3), 1)
+    except (TypeError, ValueError):
+        workers = 3
+    try:
+        if out_dir:
+            _sub2api_batch_writer = _s2cpa.Sub2APIBatchWriter(
+                _s2cpa.Path(out_dir),
+                batch_size=batch_size,
+            )
+        from concurrent.futures import ThreadPoolExecutor
+
+        _sub2api_executor = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="sub2api-verify"
+        )
+        with _sub2api_futures_lock:
+            _sub2api_futures = []
+        if log_callback:
+            if _sub2api_batch_writer is not None:
+                log_callback(
+                    f"[Sub2API] 新批次目录: {_sub2api_batch_writer.session_dir} "
+                    f"（每包 {batch_size} 个，验活并发 {workers}）"
+                )
+            else:
+                log_callback(f"[Sub2API] 远程直推已启用（验活并发 {workers}）")
+        return _sub2api_batch_writer
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Sub2API] 创建批次会话失败: {exc}")
+        return None
+
+
+def wait_sub2api_pending(log_callback=None):
+    """等待并行验活/导出任务结束。"""
+    global _sub2api_executor, _sub2api_futures
+    with _sub2api_futures_lock:
+        futures = list(_sub2api_futures)
+        _sub2api_futures = []
+    if futures:
+        if log_callback:
+            log_callback(f"[Sub2API] 等待 {len(futures)} 个验活任务完成 ...")
+        from concurrent.futures import wait
+
+        wait(futures)
+    executor = _sub2api_executor
+    _sub2api_executor = None
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=False)
+
+
 def add_sso_to_cpa(raw_token, email="", log_callback=None):
     """SSO → device-flow 换 token → 写入本地 CPA auth 目录和/或远程 CPA。
 
     SSO 本身不是 CPA 认的凭据；必须先用 device flow 换到 access/refresh token，
-    再写成 CPA 的 xai-<email>.json（type=xai + cli-chat-proxy base_url + grok-cli headers）。
+    再写成 CPA 的 xai-<email>.json（上游原生：cli-chat-proxy + grok-cli headers）。
 
     - 本地：写入 cpa_auth_dir，CPA 监听热加载
     - 远程：POST Management API /v0/management/auth-files（cpa_remote_url + cpa_management_key）
@@ -322,7 +400,13 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
 
     def _cpa_log(message):
         if log_callback:
-            log_callback(f"[CPA] {str(message).strip()}")
+            # Windows 控制台/部分 UI 回调默认 GBK，emoji 会导致整段 CPA 直出中断
+            text = str(message).strip()
+            try:
+                text.encode("gbk")
+            except UnicodeEncodeError:
+                text = text.encode("gbk", errors="replace").decode("gbk")
+            log_callback(f"[CPA] {text}")
 
     try:
         _cpa_log("SSO → device-flow 换 token ...")
@@ -345,6 +429,129 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
                 _cpa_log(f"远程上传失败: {remote_exc}")
     except Exception as exc:
         _cpa_log(f"直出失败: {exc}")
+
+
+def add_sso_to_sub2api(raw_token, email="", log_callback=None):
+    """SSO → device-flow →（可选并行验活）→ 写导入包 / 远程创建。
+
+    验活与导出在线程池中执行，不阻塞浏览器注册主循环。
+    """
+    global _sub2api_batch_writer, _sub2api_executor
+    if not config.get("sub2api_auto_add", False):
+        return
+    out_dir = str(config.get("sub2api_dir", "") or "").strip()
+    remote_url = str(config.get("sub2api_url", "") or "").strip()
+    admin_token = str(config.get("sub2api_token", "") or "").strip()
+    if not out_dir and not remote_url:
+        if log_callback:
+            log_callback("[Debug] 已开启 Sub2API 直出但未配置 sub2api_dir 或 sub2api_url，跳过")
+        return
+    if remote_url and not admin_token:
+        if log_callback:
+            log_callback("[Debug] 已配置 sub2api_url 但未配置 sub2api_token，跳过远程创建")
+        remote_url = ""
+    if not out_dir and not remote_url:
+        return
+    sso = _normalize_sso_token(raw_token)
+    if not sso:
+        return
+    proxy = str(config.get("proxy", "") or "").strip()
+    verify_enabled = bool(config.get("sub2api_verify", True))
+
+    def _s2_log(message):
+        if log_callback:
+            text = str(message).strip()
+            try:
+                text.encode("gbk")
+            except UnicodeEncodeError:
+                text = text.encode("gbk", errors="replace").decode("gbk")
+            log_callback(f"[Sub2API] {text}")
+
+    if (
+        _sub2api_executor is None
+        or (
+            out_dir
+            and (
+                _sub2api_batch_writer is None
+                or _sub2api_batch_writer.output_root.resolve()
+                != _s2cpa.Path(out_dir).resolve()
+            )
+        )
+    ):
+        begin_sub2api_batch_session(log_callback=log_callback)
+
+    job = {
+        "sso": sso,
+        "email": email,
+        "proxy": proxy,
+        "out_dir": out_dir,
+        "remote_url": remote_url,
+        "admin_token": admin_token,
+        "verify_enabled": verify_enabled,
+    }
+
+    def _worker(payload):
+        label = payload["email"] or "account"
+        try:
+            _s2_log(f"{label}: SSO → device-flow 换 token ...")
+            token = _s2cpa.sso_to_token(
+                payload["sso"], proxy=payload["proxy"], log=_s2_log
+            )
+            if not token:
+                _s2_log(f"{label}: device-flow 换 token 失败，跳过")
+                return
+            creds = _s2cpa.token_to_sub2api_credentials(
+                token, email=payload["email"]
+            )
+            if payload["verify_enabled"]:
+                _s2_log(f"{label}: 并行验活中 ...")
+                ok, message = _s2cpa.verify_grok_credentials(
+                    creds, proxy=payload["proxy"]
+                )
+                if not ok:
+                    _s2_log(f"{label}: 验活失败，跳过导出 ({message})")
+                    return
+                _s2_log(f"{label}: 验活通过 ({message})")
+            with _sub2api_io_lock:
+                if payload["out_dir"]:
+                    writer = _sub2api_batch_writer
+                    if writer is None:
+                        raise RuntimeError("未能创建 Sub2API 批次写入器")
+                    result = writer.add_credentials(creds, name=payload["email"])
+                    _s2_log(
+                        f"{label}: 已写入第 {result['package_index']:03d} 包 "
+                        f"({result['position']}/{result['batch_size']}): {result['path']}"
+                    )
+                if payload["remote_url"]:
+                    created = _s2cpa.upload_sub2api_account(
+                        payload["remote_url"],
+                        payload["admin_token"],
+                        creds,
+                        name=payload["email"],
+                    )
+                    created_id = ""
+                    if isinstance(created, dict):
+                        data = (
+                            created.get("data")
+                            if isinstance(created.get("data"), dict)
+                            else created
+                        )
+                        created_id = str((data or {}).get("id") or "")
+                    _s2_log(
+                        f"{label}: 已创建远程账号"
+                        f"{(' id=' + created_id) if created_id else ''}"
+                    )
+        except Exception as exc:
+            _s2_log(f"{label}: 直出失败: {exc}")
+
+    executor = _sub2api_executor
+    if executor is None:
+        _worker(job)
+        return
+    future = executor.submit(_worker, job)
+    with _sub2api_futures_lock:
+        _sub2api_futures.append(future)
+    _s2_log(f"{email or 'account'}: 已提交并行验活/导出")
 
 
 def create_browser_options():
@@ -770,6 +977,11 @@ def get_email_and_token(api_key=None):
             # cloudflare_temp_email 专用模式
             return cloudflare_create_temp_address(api_base)
         except Exception as primary_exc:
+            # new_address / admin 创建失败时不要回退 Mail.tm 风格接口，
+            # 否则 /api/domains 的 401 会掩盖真实错误（如域名配错）。
+            create_path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
+            if create_path.rstrip("/").lower().endswith("/new_address"):
+                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}") from primary_exc
             # 兜底回退到 Mail.tm 风格
             key = api_key or get_cloudflare_api_key()
             domains = cloudflare_get_domains(api_base, api_key=key)
@@ -2668,6 +2880,44 @@ class GrokRegisterGUI:
         self.cpa_management_key_entry = tk_entry(config_frame, textvariable=self.cpa_management_key_var, width=28)
         add_field(self.cpa_management_key_entry, 7, 3)
 
+        add_label(8, 0, "Sub2API 直出:")
+        self.sub2api_auto_add_var = tk.BooleanVar(value=bool(config.get("sub2api_auto_add", False)))
+        self.sub2api_auto_add_check = tk_checkbutton(config_frame, variable=self.sub2api_auto_add_var)
+        add_field(self.sub2api_auto_add_check, 8, 1, sticky=tk.W)
+
+        add_label(9, 0, "Sub2API 目录:")
+        self.sub2api_dir_var = tk.StringVar(value=str(config.get("sub2api_dir", "")))
+        self.sub2api_dir_entry = tk_entry(config_frame, textvariable=self.sub2api_dir_var, width=72)
+        add_field(self.sub2api_dir_entry, 9, 1, columnspan=3)
+
+        add_label(10, 0, "Sub2API 地址:")
+        self.sub2api_url_var = tk.StringVar(value=str(config.get("sub2api_url", "")))
+        self.sub2api_url_entry = tk_entry(config_frame, textvariable=self.sub2api_url_var, width=40)
+        add_field(self.sub2api_url_entry, 10, 1)
+
+        add_label(10, 2, "Sub2API Token:")
+        self.sub2api_token_var = tk.StringVar(value=str(config.get("sub2api_token", "")))
+        self.sub2api_token_entry = tk_entry(config_frame, textvariable=self.sub2api_token_var, width=28)
+        add_field(self.sub2api_token_entry, 10, 3)
+
+        add_label(11, 0, "Sub2API 每包数量:")
+        self.sub2api_batch_size_var = tk.StringVar(
+            value=str(config.get("sub2api_batch_size", 20))
+        )
+        self.sub2api_batch_size_entry = tk_entry(
+            config_frame, textvariable=self.sub2api_batch_size_var, width=12
+        )
+        add_field(self.sub2api_batch_size_entry, 11, 1, sticky=tk.W)
+
+        add_label(11, 2, "并行验活:")
+        self.sub2api_verify_var = tk.BooleanVar(
+            value=bool(config.get("sub2api_verify", True))
+        )
+        self.sub2api_verify_check = tk_checkbutton(
+            config_frame, variable=self.sub2api_verify_var
+        )
+        add_field(self.sub2api_verify_check, 11, 3, sticky=tk.W)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -2755,6 +3005,18 @@ class GrokRegisterGUI:
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        config["sub2api_auto_add"] = bool(self.sub2api_auto_add_var.get())
+        config["sub2api_dir"] = self.sub2api_dir_var.get().strip()
+        config["sub2api_url"] = self.sub2api_url_var.get().strip()
+        config["sub2api_token"] = self.sub2api_token_var.get().strip()
+        try:
+            config["sub2api_batch_size"] = max(
+                int(self.sub2api_batch_size_var.get().strip()), 1
+            )
+        except Exception:
+            self.log("[!] Sub2API 每包数量无效")
+            return
+        config["sub2api_verify"] = bool(self.sub2api_verify_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -2784,6 +3046,7 @@ class GrokRegisterGUI:
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+        begin_sub2api_batch_session(log_callback=self.log)
         threading.Thread(
             target=self.run_registration,
             args=(count,),
@@ -2880,6 +3143,7 @@ class GrokRegisterGUI:
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
                     add_sso_to_cpa(sso, email=email, log_callback=self.log)
+                    add_sso_to_sub2api(sso, email=email, log_callback=self.log)
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -2937,6 +3201,10 @@ class GrokRegisterGUI:
             self.log(f"[!] 任务异常: {exc}")
         finally:
             try:
+                wait_sub2api_pending(log_callback=self.log)
+            except BaseException:
+                pass
+            try:
                 stop_browser()
             except BaseException:
                 pass
@@ -2988,6 +3256,7 @@ def run_registration_cli(count):
     )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    begin_sub2api_batch_session(log_callback=cli_log)
     try:
         start_browser(log_callback=cli_log)
         cli_log("[*] 浏览器已启动")
@@ -3070,6 +3339,7 @@ def run_registration_cli(count):
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                add_sso_to_sub2api(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
@@ -3130,6 +3400,10 @@ def run_registration_cli(count):
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except Exception:
+            pass
+        try:
+            wait_sub2api_pending(log_callback=cli_log)
+        except BaseException:
             pass
         try:
             cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")

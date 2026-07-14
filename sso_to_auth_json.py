@@ -38,9 +38,9 @@ SCOPES = (
 )
 
 # --- CLIProxyAPI (CPA) 扁平格式常量 ------------------------------------------
-# CPA 的 internal/auth/xai/token.go TokenStorage 读的是扁平字段。
-# Build/CLI token（scope 含 grok-cli:access）必须走 cli-chat-proxy.grok.com，
-# 不能用默认 api.x.ai/v1（那是计费通道，会 402）。
+# 与上游 grokRegister-cpa 原生导出保持一致：
+# Build/CLI token（scope 含 grok-cli:access）走 cli-chat-proxy.grok.com，
+# 并附带 grok-cli headers（见 token_to_cpa_record）。
 CPA_TOKEN_ENDPOINT = f"{OIDC_ISSUER}/oauth2/token"
 CPA_GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_GROK_HEADERS = {
@@ -48,6 +48,59 @@ CPA_GROK_HEADERS = {
     "x-grok-client-version": "0.2.93",
     "x-grok-client-identifier": "grok-shell",
 }
+
+# --- Sub2API (Wei-Shaw/sub2api) Grok OAuth credentials ----------------------
+# 对齐 backend/internal/service/grok_oauth_service.go BuildAccountCredentials
+SUB2API_CLIENT_ID = CLIENT_ID
+SUB2API_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+SUB2API_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+# 与 Sub2API v0.1.152 / CPA 原生导出保持一致，避免上游 426 version(none)
+SUB2API_VERIFY_HEADERS = {
+    "X-XAI-Token-Auth": "xai-grok-cli",
+    "x-grok-client-version": "0.2.93",
+    "x-grok-client-identifier": "grok-shell",
+    "Accept": "application/json",
+}
+
+
+def verify_grok_credentials(
+    creds: dict,
+    proxy: str = "",
+    timeout: int = 25,
+) -> tuple[bool, str]:
+    """对 cli-chat-proxy 发起一次 /models 验活。
+
+    返回 (ok, message)。2xx/3xx 视为通过；401/403/426 等视为失败。
+    """
+    access = str((creds or {}).get("access_token") or "").strip()
+    if not access:
+        return False, "missing access_token"
+    base = str((creds or {}).get("base_url") or SUB2API_BASE_URL).strip().rstrip("/")
+    url = f"{base}/models"
+    headers = dict(SUB2API_VERIFY_HEADERS)
+    headers["Authorization"] = f"Bearer {access}"
+    kwargs = {
+        "headers": headers,
+        "timeout": timeout,
+        "impersonate": "chrome",
+    }
+    proxy = str(proxy or "").strip()
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    try:
+        resp = requests.get(url, **kwargs)
+    except Exception as exc:
+        return False, f"request_error: {exc}"
+    status = int(getattr(resp, "status_code", 0) or 0)
+    body = (getattr(resp, "text", "") or "").strip().replace("\n", " ")
+    if len(body) > 160:
+        body = body[:160] + "..."
+    if 200 <= status < 400:
+        return True, f"HTTP {status}"
+    detail = f"HTTP {status}"
+    if body:
+        detail = f"{detail}: {body}"
+    return False, detail
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -92,7 +145,7 @@ def request_device_code(proxy: str = "", log=print) -> dict | None:
         with _urlopen(req, proxy=proxy, timeout=15) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        log(f"  ❌ device/code HTTP {e.code}: {e.read().decode()[:200]}")
+        log(f"  [x] device/code HTTP {e.code}: {e.read().decode()[:200]}")
         return None
 
 
@@ -124,9 +177,9 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
             if error == "slow_down":
                 interval += 5
                 continue
-            log(f"  ❌ token: {error}")
+            log(f"  [x] token: {error}")
             return None
-    log("  ❌ 轮询超时")
+    log("  [x] 轮询超时")
     return None
 
 
@@ -141,18 +194,18 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     try:
         r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
     except Exception as e:
-        log(f"  ❌ 网络错误: {e}")
+        log(f"  [x] 网络错误: {e}")
         return None
     if "sign-in" in r.url or "sign-up" in r.url:
-        log("  ❌ sso 无效")
+        log("  [x] sso 无效")
         return None
-    log("  ✅ sso 有效")
+    log("  [ok] sso 有效")
 
-    log("  🔑 Device Flow...")
+    log("  [*] Device Flow...")
     dc = request_device_code(proxy=proxy, log=log)
     if not dc:
         return None
-    log(f"  📋 user_code: {dc.get('user_code')}")
+    log(f"  [*] user_code: {dc.get('user_code')}")
 
     try:
         s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15)
@@ -165,10 +218,10 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
             allow_redirects=True,
         )
         if "consent" not in r.url:
-            log(f"  ❌ verify 失败: {r.url}")
+            log(f"  [x] verify 失败: {r.url}")
             return None
     except Exception as e:
-        log(f"  ❌ verify 异常: {e}")
+        log(f"  [x] verify 异常: {e}")
         return None
 
     try:
@@ -186,11 +239,11 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
             allow_redirects=True,
         )
         if "done" not in r.url:
-            log(f"  ❌ approve 失败: {r.url}")
+            log(f"  [x] approve 失败: {r.url}")
             return None
-        log("  ✅ 授权确认")
+        log("  [ok] 授权确认")
     except Exception as e:
-        log(f"  ❌ approve 异常: {e}")
+        log(f"  [x] approve 异常: {e}")
         return None
 
     token = poll_token(
@@ -203,7 +256,7 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     if not token:
         return None
     log(
-        f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+        f"  [ok] access_token (expires_in={token.get('expires_in')}s)"
         + (" + refresh_token" if token.get("refresh_token") else "")
     )
     return token
@@ -264,8 +317,7 @@ def _safe_email_for_filename(email: str) -> str:
 def token_to_cpa_record(token: dict, email: str = "") -> dict:
     """token dict → CLIProxyAPI 扁平 xai auth 记录。
 
-    对齐 CPA internal/auth/xai/token.go 的 TokenStorage 字段，以及
-    grok-build-auth build_cliproxyapi_auth_record 的输出。
+    对齐上游 grokRegister-cpa 原生导出（cli-chat-proxy + grok-cli headers）。
     """
     access = token.get("access_token") or token.get("key") or ""
     refresh = token.get("refresh_token") or ""
@@ -328,6 +380,304 @@ def write_cpa_auth(auth_dir: Path, record: dict) -> Path:
     tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return path
+
+
+def token_to_sub2api_credentials(token: dict, email: str = "") -> dict:
+    """token dict → Sub2API Grok OAuth credentials（BuildAccountCredentials）。
+
+    官方字段：access_token / refresh_token / token_type / expires_at / email /
+    id_token / client_id / scope / base_url（cli-chat-proxy）。
+    参考：https://github.com/Wei-Shaw/sub2api
+    """
+    access = token.get("access_token") or token.get("key") or ""
+    refresh = token.get("refresh_token") or ""
+    id_token = token.get("id_token") or ""
+    payload = decode_jwt_payload(access)
+    id_payload = decode_jwt_payload(id_token) if id_token else {}
+
+    if not email:
+        email = id_payload.get("email") or payload.get("email") or ""
+
+    expires_at = ""
+    if "exp" in payload:
+        expires_at = _iso_utc_from_unix(payload["exp"])
+    elif token.get("expires_in") is not None:
+        try:
+            expires_at = _iso_utc_from_unix(int(time.time()) + int(token["expires_in"]))
+        except Exception:
+            expires_at = ""
+    if not expires_at:
+        expires_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    creds: dict = {
+        "access_token": access,
+        "expires_at": expires_at,
+        "base_url": SUB2API_BASE_URL,
+        "client_id": SUB2API_CLIENT_ID,
+        "scope": SUB2API_SCOPE,
+    }
+    if refresh:
+        creds["refresh_token"] = refresh
+    token_type = str(token.get("token_type") or "Bearer").strip()
+    if token_type:
+        creds["token_type"] = token_type
+    if id_token:
+        creds["id_token"] = id_token
+    if email:
+        creds["email"] = email
+    return creds
+
+
+SUB2API_DATA_TYPE = "sub2api-data"
+SUB2API_DATA_VERSION = 1
+SUB2API_IMPORT_BUNDLE_NAME = "sub2api_accounts_import.json"
+
+
+def sub2api_auth_filename(creds: dict) -> str:
+    """生成 Sub2API 导入文件名：grok-<email>.json。"""
+    ident = str(creds.get("email") or "").strip()
+    if not ident:
+        payload = decode_jwt_payload(str(creds.get("access_token") or ""))
+        ident = str(payload.get("sub") or "").strip() or "unknown"
+    safe = _safe_email_for_filename(ident)
+    fname = safe if safe.lower().startswith("grok") else f"grok-{safe}"
+    return f"{fname}.json"
+
+
+def _sub2api_expires_unix(creds: dict) -> int | None:
+    """从 credentials.expires_at（ISO/unix）解析账号级 expires_at（unix 秒）。"""
+    raw = creds.get("expires_at")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    text = str(raw).strip()
+    if text.isdigit():
+        return int(text)
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+    ):
+        try:
+            dt = datetime.strptime(text.replace("Z", "+0000") if fmt.endswith("%z") and text.endswith("Z") else text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    try:
+        # RFC3339 fallback: 2026-07-13T07:56:53Z
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text[:-1]).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def build_sub2api_account_payload(
+    creds: dict,
+    name: str = "",
+    concurrency: int = 1,
+    priority: int = 50,
+) -> dict:
+    """组装单条 Sub2API 账号（Management API 创建 / 数据导入 accounts[] 共用）。"""
+    email = str(creds.get("email") or "").strip()
+    account_name = (name or email or "Grok OAuth Account").strip()
+    account: dict = {
+        "name": account_name,
+        "platform": "grok",
+        "type": "oauth",
+        "credentials": creds,
+        "concurrency": max(int(concurrency or 1), 1),
+        "priority": int(priority if priority is not None else 50),
+        "rate_multiplier": 1,
+        # False：避免 access_token 到期后被踢出调度，导致 refresh_token 永远无法触发
+        "auto_pause_on_expired": False,
+    }
+    expires_unix = _sub2api_expires_unix(creds)
+    if expires_unix is not None:
+        account["expires_at"] = expires_unix
+    return account
+
+
+def build_sub2api_data_payload(accounts: list, proxies: list | None = None) -> dict:
+    """组装 Sub2API「导入数据」所需的导出包（type=sub2api-data）。"""
+    return {
+        "type": SUB2API_DATA_TYPE,
+        "version": SUB2API_DATA_VERSION,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": list(proxies or []),
+        "accounts": list(accounts or []),
+    }
+
+
+def _account_identity(account: dict) -> str:
+    creds = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
+    email = str((creds or {}).get("email") or account.get("name") or "").strip().lower()
+    return email
+
+
+class Sub2APIBatchWriter:
+    """按固定数量将账号实时写入独立的 Sub2API 导入包。"""
+
+    def __init__(
+        self,
+        output_root: Path,
+        batch_size: int = 20,
+        session_name: str | None = None,
+    ):
+        self.output_root = Path(output_root)
+        self.batch_size = max(int(batch_size or 20), 1)
+        self.session_name = session_name or datetime.now().strftime(
+            "batch_%Y%m%d_%H%M%S_%f"
+        )
+        self.session_dir = self.output_root / self.session_name
+        self.session_dir.mkdir(parents=True, exist_ok=False)
+        self._packages: list[list[dict]] = []
+        self._locations: dict[str, tuple[int, int]] = {}
+        self.total_accounts = 0
+
+    @property
+    def package_count(self) -> int:
+        return len(self._packages)
+
+    def _package_path(self, package_index: int) -> Path:
+        return self.session_dir / f"sub2api_accounts_{package_index + 1:03d}.json"
+
+    def _write_package(self, package_index: int) -> Path:
+        path = self._package_path(package_index)
+        payload = build_sub2api_data_payload(self._packages[package_index])
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+        return path
+
+    def add_credentials(self, creds: dict, name: str = "") -> dict:
+        """加入一条账号并立即写盘；重复邮箱更新原位置，不增加计数。"""
+        account = build_sub2api_account_payload(creds, name=name)
+        identity = _account_identity(account)
+        location = self._locations.get(identity) if identity else None
+
+        if location is None:
+            package_index = self.total_accounts // self.batch_size
+            if package_index == len(self._packages):
+                self._packages.append([])
+            account_index = len(self._packages[package_index])
+            self._packages[package_index].append(account)
+            if identity:
+                self._locations[identity] = (package_index, account_index)
+            self.total_accounts += 1
+        else:
+            package_index, account_index = location
+            self._packages[package_index][account_index] = account
+
+        path = self._write_package(package_index)
+        return {
+            "path": path,
+            "package_index": package_index + 1,
+            "position": account_index + 1,
+            "batch_size": self.batch_size,
+            "total_accounts": self.total_accounts,
+        }
+
+
+def upsert_sub2api_import_bundle(auth_dir: Path, account: dict) -> Path:
+    """把账号 upsert 进目录内合并导入包 sub2api_accounts_import.json。"""
+    auth_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = auth_dir / SUB2API_IMPORT_BUNDLE_NAME
+    accounts: list = []
+    proxies: list = []
+    if bundle_path.exists():
+        try:
+            existing = json.loads(bundle_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                if isinstance(existing.get("accounts"), list):
+                    accounts = existing["accounts"]
+                if isinstance(existing.get("proxies"), list):
+                    proxies = existing["proxies"]
+        except Exception:
+            accounts = []
+            proxies = []
+
+    identity = _account_identity(account)
+    kept = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        if identity and _account_identity(item) == identity:
+            continue
+        kept.append(item)
+    kept.append(account)
+    payload = build_sub2api_data_payload(kept, proxies=proxies)
+    tmp = bundle_path.with_suffix(bundle_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, bundle_path)
+    return bundle_path
+
+
+def write_sub2api_auth(auth_dir: Path, creds: dict) -> Path:
+    """写出可直接用于 Sub2API「导入数据」的 JSON（单账号导出包），并更新合并包。"""
+    auth_dir.mkdir(parents=True, exist_ok=True)
+    account = build_sub2api_account_payload(creds)
+    payload = build_sub2api_data_payload([account])
+    path = auth_dir / sub2api_auth_filename(creds)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    upsert_sub2api_import_bundle(auth_dir, account)
+    return path
+
+
+def upload_sub2api_account(
+    base_url: str,
+    admin_token: str,
+    creds: dict,
+    name: str = "",
+    timeout: int = 30,
+) -> dict:
+    """通过 Sub2API 管理接口创建 Grok OAuth 账号。
+
+    POST {base}/api/v1/admin/accounts
+    Header: Authorization: Bearer <admin_token>
+    """
+    import requests
+
+    base = str(base_url or "").strip().rstrip("/")
+    token = str(admin_token or "").strip()
+    if not base:
+        raise ValueError("sub2api_url 为空")
+    if not token:
+        raise ValueError("sub2api_token 为空")
+
+    payload = build_sub2api_account_payload(creds, name=name)
+    url = f"{base}/api/v1/admin/accounts"
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=timeout,
+    )
+    if resp.status_code >= 400:
+        body = (resp.text or "").strip()
+        if len(body) > 300:
+            body = body[:300] + "..."
+        raise RuntimeError(f"Sub2API 创建账号失败 HTTP {resp.status_code}: {body or resp.reason}")
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": (resp.text or "")[:300]}
 
 
 def upload_cpa_auth_remote(
@@ -449,6 +799,21 @@ def main() -> int:
         default=None,
         help="远程 CPA 管理密钥（remote-management.secret-key 明文）",
     )
+    ap.add_argument(
+        "--sub2api-dir",
+        default=None,
+        help="写出 Sub2API 导入包 JSON（type=sub2api-data，可直接「导入数据」）到该目录",
+    )
+    ap.add_argument(
+        "--sub2api-url",
+        default=None,
+        help="Sub2API 地址，如 http://127.0.0.1:8080；配合 --sub2api-token 通过管理 API 创建账号",
+    )
+    ap.add_argument(
+        "--sub2api-token",
+        default=None,
+        help="Sub2API 管理员 Bearer Token（Authorization）",
+    )
     ap.add_argument("--proxy", default="", help="device-flow 走代理，如 http://127.0.0.1:7890")
     args = ap.parse_args()
 
@@ -460,23 +825,33 @@ def main() -> int:
         ap.error("使用 --cpa-remote-url 时必须同时提供 --cpa-management-key")
     if args.cpa_management_key and not args.cpa_remote_url:
         ap.error("使用 --cpa-management-key 时必须同时提供 --cpa-remote-url")
+    if args.sub2api_url and not args.sub2api_token:
+        ap.error("使用 --sub2api-url 时必须同时提供 --sub2api-token")
+    if args.sub2api_token and not args.sub2api_url:
+        ap.error("使用 --sub2api-token 时必须同时提供 --sub2api-url")
 
-    if len(cookies) > 1 and not args.out_dir and not args.merge:
-        # 默认批量写目录
-        args.out_dir = args.out_dir or "./auth_out"
+    export_only = bool(
+        args.cpa_auth_dir or args.cpa_remote_url or args.sub2api_dir or args.sub2api_url
+    ) and not args.out and not args.out_dir and not args.merge
+
+    if len(cookies) > 1 and not args.out_dir and not args.merge and not export_only:
+        # 默认批量写目录（仅在未指定 CPA/Sub2API 目标时）
+        args.out_dir = "./auth_out"
         print(f"批量模式默认 --out-dir {args.out_dir}")
 
-    # 只指定 CPA 目标时不再默认写官方 ~/.grok/auth.json
+    # 只指定导出目标时不再默认写官方 ~/.grok/auth.json / uuid.json
     if (
         args.out is None
         and args.out_dir is None
         and not args.cpa_auth_dir
         and not args.cpa_remote_url
+        and not args.sub2api_dir
+        and not args.sub2api_url
         and len(cookies) == 1
     ):
         args.out = str(Path.home() / ".grok" / "auth.json")
 
-    print(f"🚀 SSO → auth.json: {len(cookies)} 个, delay={args.delay}s")
+    print(f"[*] SSO → auth.json: {len(cookies)} 个, delay={args.delay}s")
     ok = 0
     fail = 0
 
@@ -486,7 +861,7 @@ def main() -> int:
             token = sso_to_token(sso, proxy=args.proxy)
             if not token:
                 fail += 1
-                print(f"  ❌ [{i}] 失败")
+                print(f"  [x] [{i}] 失败")
                 continue
             key, entry = token_to_auth_entry(token, email=args.email)
             uid = entry.get("user_id") or secrets.token_hex(4)
@@ -494,38 +869,56 @@ def main() -> int:
             if args.out_dir:
                 p = Path(args.out_dir) / f"{uid}.json"
                 write_auth_json(p, key, entry)
-                print(f"  💾 {p}")
+                print(f"  [save] {p}")
             if args.out:
                 if args.merge or len(cookies) > 1:
                     merge_auth_json(Path(args.out), key, entry, unique=True)
-                    print(f"  💾 merge → {args.out}")
+                    print(f"  [save] merge → {args.out}")
                 else:
                     write_auth_json(Path(args.out), key, entry)
-                    print(f"  💾 {args.out}")
+                    print(f"  [save] {args.out}")
 
             if args.cpa_auth_dir or args.cpa_remote_url:
                 record = token_to_cpa_record(token, email=args.email)
                 if args.cpa_auth_dir:
                     cp = write_cpa_auth(Path(args.cpa_auth_dir), record)
-                    print(f"  💾 CPA 本地 → {cp}")
+                    print(f"  [save] CPA 本地 → {cp}")
                 if args.cpa_remote_url:
                     name = upload_cpa_auth_remote(
                         args.cpa_remote_url,
                         args.cpa_management_key,
                         record,
                     )
-                    print(f"  💾 CPA 远程 → {args.cpa_remote_url.rstrip('/')}/.../{name}")
+                    print(f"  [save] CPA 远程 → {args.cpa_remote_url.rstrip('/')}/.../{name}")
+
+            if args.sub2api_dir or args.sub2api_url:
+                creds = token_to_sub2api_credentials(token, email=args.email)
+                if args.sub2api_dir:
+                    sp = write_sub2api_auth(Path(args.sub2api_dir), creds)
+                    print(f"  [save] Sub2API 本地 → {sp}")
+                if args.sub2api_url:
+                    created = upload_sub2api_account(
+                        args.sub2api_url,
+                        args.sub2api_token,
+                        creds,
+                        name=args.email,
+                    )
+                    created_id = ""
+                    if isinstance(created, dict):
+                        data = created.get("data") if isinstance(created.get("data"), dict) else created
+                        created_id = str((data or {}).get("id") or "")
+                    print(f"  [save] Sub2API 远程账号已创建{(' id=' + created_id) if created_id else ''}")
 
             ok += 1
-            print(f"  ✅ [{i}] 完成 user_id={uid[:12]}...")
+            print(f"  [ok] [{i}] 完成 user_id={uid[:12]}...")
         except Exception as e:
             fail += 1
-            print(f"  ❌ [{i}] 异常: {e}")
+            print(f"  [x] [{i}] 异常: {e}")
 
         if args.delay > 0 and i < len(cookies):
             time.sleep(args.delay)
 
-    print(f"\n{'=' * 60}\n📊 完成: {ok}/{len(cookies)} 成功, {fail} 失败")
+    print(f"\n{'=' * 60}\n[=] 完成: {ok}/{len(cookies)} 成功, {fail} 失败")
     return 0 if fail == 0 else 1
 
 
