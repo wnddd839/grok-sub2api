@@ -53,6 +53,15 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    # cloud-mail: /api/public/genToken + addUser + emailList
+    "cloud_mail_api_base": "",
+    "cloud_mail_token": "",
+    "cloud_mail_admin_email": "",
+    "cloud_mail_admin_password": "",
+    "cloud_mail_path_token": "/api/public/genToken",
+    "cloud_mail_path_accounts": "/api/public/addUser",
+    "cloud_mail_path_messages": "/api/public/emailList",
+    "browser_path": "",
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
@@ -243,21 +252,29 @@ def cloudflare_is_admin_create_path(path):
 
 
 def _pick_list_payload(data):
+    list_keys = (
+        "results",
+        "hydra:member",
+        "data",
+        "messages",
+        "list",
+        "records",
+        "rows",
+        "items",
+    )
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        if isinstance(data.get("results"), list):
-            return data.get("results")
-        if isinstance(data.get("hydra:member"), list):
-            return data.get("hydra:member")
-        if isinstance(data.get("data"), list):
-            return data.get("data")
-        if isinstance(data.get("messages"), list):
-            return data.get("messages")
-        if isinstance(data.get("data"), dict):
-            nested = data.get("data")
-            if isinstance(nested.get("messages"), list):
-                return nested.get("messages")
+        for key in list_keys:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            for key in list_keys:
+                value = nested.get(key)
+                if isinstance(value, list):
+                    return value
     return []
 
 
@@ -554,10 +571,75 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None):
     _s2_log(f"{email or 'account'}: 已提交并行验活/导出")
 
 
+BROWSER_PATH_HINT = (
+    "未能找到浏览器。请在 config.json 配置 browser_path 指向 chrome/edge/chromium 可执行文件，"
+    "或确保系统 PATH 中存在上述浏览器。"
+)
+
+
+def detect_browser_path():
+    """跨平台探测浏览器可执行文件路径；找不到返回空串。"""
+    if sys.platform.startswith("win"):
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        ]
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        try:
+            import winreg
+            for sub in (
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+            ):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub) as key:
+                        val, _ = winreg.QueryValueEx(key, "")
+                        if val and os.path.exists(val):
+                            return val
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        return ""
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return ""
+    # linux / other unix
+    from shutil import which
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable"):
+        found = which(name)
+        if found:
+            return found
+    return ""
+
+
 def create_browser_options():
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    configured = str(config.get("browser_path", "") or "").strip()
+    if configured:
+        if not os.path.exists(configured):
+            raise RuntimeError(f"配置的 browser_path 不存在: {configured}")
+        options.set_browser_path(configured)
+    else:
+        detected = detect_browser_path()
+        if detected:
+            options.set_browser_path(detected)
+        # 探测失败时不在此抛错；让 Chromium() 构造时抛错并由 start_browser 给提示
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -746,6 +828,216 @@ def cloudflare_get_message_detail(api_base, token, message_id):
 
 
 YYDS_API_BASE = "https://maliapi.215.im/v1"
+
+
+def get_cloud_mail_api_base():
+    base = str(config.get("cloud_mail_api_base", "") or "").strip()
+    if not base:
+        base = get_cloudflare_api_base()
+    return base.rstrip("/")
+
+
+def get_cloud_mail_path(key, default_path):
+    raw = str(config.get(key, default_path) or default_path).strip()
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    return raw
+
+
+def cloud_mail_auth_headers(token=None, content_type=False):
+    headers = {"Content-Type": "application/json"} if content_type else {}
+    auth = str(token or config.get("cloud_mail_token", "") or get_cloudflare_api_key() or "").strip()
+    if auth:
+        # 文档要求 Authorization 填 token 本体；若已带 Bearer 则原样保留
+        headers["Authorization"] = auth
+    return headers
+
+
+def cloud_mail_post(url, payload, token=None):
+    """POST JSON；非 2xx 时自动再试一次 Bearer 前缀。"""
+    headers = cloud_mail_auth_headers(token=token, content_type=True)
+    resp = http_post(url, json=payload, headers=headers)
+    if resp.status_code < 400:
+        return resp
+    auth = str(headers.get("Authorization", "") or "").strip()
+    if auth and not auth.lower().startswith("bearer "):
+        headers_bearer = dict(headers)
+        headers_bearer["Authorization"] = f"Bearer {auth}"
+        return http_post(url, json=payload, headers=headers_bearer)
+    return resp
+
+
+def cloud_mail_ensure_token(log_callback=None):
+    """返回可用 Authorization token：优先配置值，否则 genToken。"""
+    token = str(config.get("cloud_mail_token", "") or get_cloudflare_api_key() or "").strip()
+    if token:
+        return token
+    api_base = get_cloud_mail_api_base()
+    email = str(config.get("cloud_mail_admin_email", "") or "").strip()
+    password = str(config.get("cloud_mail_admin_password", "") or "").strip()
+    if not api_base:
+        raise Exception("cloud-mail API Base 未配置")
+    if not email or not password:
+        raise Exception("cloud-mail 需配置 cloud_mail_token，或 cloud_mail_admin_email + cloud_mail_admin_password")
+    path = get_cloud_mail_path("cloud_mail_path_token", "/api/public/genToken")
+    resp = http_post(
+        f"{api_base}{path}",
+        json={"email": email, "password": password},
+        headers={"Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"cloud-mail genToken 非JSON: {resp.text[:300]}")
+    if isinstance(data, dict):
+        if str(data.get("code", 200)) not in ("200", "0", "") and data.get("code") not in (200, 0, None):
+            raise Exception(f"cloud-mail genToken 失败: {data}")
+        nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+        token = str(
+            data.get("token")
+            or nested.get("token")
+            or data.get("data")
+            or ""
+        ).strip()
+        if token and token.startswith("{"):
+            token = ""
+        if not token and isinstance(data.get("data"), str):
+            token = data.get("data").strip()
+    else:
+        token = ""
+    if not token:
+        raise Exception(f"cloud-mail genToken 未返回 token: {data}")
+    config["cloud_mail_token"] = token
+    save_config()
+    if log_callback:
+        log_callback("[*] cloud-mail 已生成 Authorization token")
+    return token
+
+
+def cloud_mail_create_address(api_base=None, log_callback=None):
+    """POST /api/public/addUser 创建邮箱，返回 (address, auth_token)。"""
+    api_base = (api_base or get_cloud_mail_api_base()).rstrip("/")
+    if not api_base:
+        raise Exception("cloud-mail API Base 未配置")
+    token = cloud_mail_ensure_token(log_callback=log_callback)
+    domain = cloudflare_next_default_domain()
+    if not domain:
+        raise Exception("cloud-mail 需配置 defaultDomains 收信域名")
+    username = generate_username(10)
+    address = f"{username}@{domain}"
+    password = secrets.token_urlsafe(12)
+    path = get_cloud_mail_path("cloud_mail_path_accounts", "/api/public/addUser")
+    payload = {"list": [{"email": address, "password": password}]}
+    resp = cloud_mail_post(f"{api_base}{path}", payload, token=token)
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+    if resp.status_code >= 400:
+        raise Exception(f"cloud-mail addUser HTTP {resp.status_code}: {data or resp.text[:300]}")
+    if isinstance(data, dict):
+        code = data.get("code", 200)
+        if code not in (200, 0, "200", "0", None, ""):
+            raise Exception(f"cloud-mail addUser 失败: {data}")
+    if log_callback:
+        log_callback(f"[*] cloud-mail 已创建邮箱: {address}")
+    return address, token
+
+
+def cloud_mail_get_messages(api_base, token, email):
+    """POST /api/public/emailList 拉取收件列表。"""
+    path = get_cloud_mail_path("cloud_mail_path_messages", "/api/public/emailList")
+    payload = {
+        "toEmail": email,
+        "timeSort": "desc",
+        "type": 0,
+        "isDel": 0,
+        "num": 1,
+        "size": 20,
+    }
+    resp = cloud_mail_post(f"{api_base}{path}", payload, token=token)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"cloud-mail emailList 非JSON: {resp.text[:300]}")
+    if isinstance(data, dict) and data.get("code") not in (200, 0, "200", "0", None, ""):
+        raise Exception(f"cloud-mail emailList 失败: {data}")
+    return _pick_list_payload(data)
+
+
+def cloud_mail_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    api_base = get_cloud_mail_api_base()
+    if not api_base:
+        raise Exception("cloud-mail API Base 未配置")
+    token = str(dev_token or config.get("cloud_mail_token", "") or get_cloudflare_api_key() or "").strip()
+    if not token:
+        token = cloud_mail_ensure_token(log_callback=log_callback)
+    deadline = time.time() + timeout
+    seen_attempts = {}
+    next_resend_at = time.time() + 35
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
+            next_resend_at = time.time() + 35
+        try:
+            messages = cloud_mail_get_messages(api_base, token, email)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] cloud-mail 拉取邮件失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        if log_callback:
+            log_callback(f"[Debug] cloud-mail 本轮邮件数量: {len(messages)}")
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            msg_id = msg.get("emailId") or msg.get("id") or msg.get("msgid")
+            attempt = int(seen_attempts.get(msg_id, 0)) if msg_id is not None else 0
+            if msg_id is not None and attempt >= 5:
+                continue
+            if msg_id is not None:
+                seen_attempts[msg_id] = attempt + 1
+            to_email = str(msg.get("toEmail", "") or "").lower()
+            if to_email and to_email != email.lower():
+                continue
+            parts = []
+            for field in ("text", "content", "raw", "intro", "body", "snippet"):
+                value = msg.get(field)
+                if isinstance(value, str) and value.strip():
+                    if field == "content" or "<" in value:
+                        parts.append(re.sub(r"<[^>]+>", " ", value))
+                    else:
+                        parts.append(value)
+            subject = str(msg.get("subject", "") or "")
+            combined = "\n".join(parts)
+            if log_callback:
+                log_callback(f"[Debug] cloud-mail 收到邮件: {subject}")
+            code = extract_verification_code(combined, subject)
+            if code:
+                if log_callback:
+                    log_callback(f"[*] cloud-mail 从邮件中提取到验证码: {code}")
+                return code
+            if log_callback and msg_id is not None:
+                log_callback(f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts.get(msg_id)}")
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"cloud-mail 在 {timeout}s 内未收到验证码邮件")
 
 
 def get_yyds_api_key():
@@ -961,14 +1253,61 @@ def pick_domain(api_key=None):
     raise Exception("DuckMail 无已验证域名可用")
 
 
+def normalize_email_provider(provider):
+    value = str(provider or "duckmail").strip().lower().replace("_", "-")
+    if value in ("cloudmail",):
+        return "cloud-mail"
+    return value or "duckmail"
+
+
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    return normalize_email_provider(config.get("email_provider", "duckmail"))
 
 
-def get_email_and_token(api_key=None):
+def is_cloud_mail_provider(provider=None):
+    return normalize_email_provider(provider or get_email_provider()) == "cloud-mail"
+
+
+def format_cloudflare_paths_value():
+    return ",".join(
+        [
+            str(config.get("cloudflare_path_domains", "/api/domains") or "/api/domains"),
+            str(config.get("cloudflare_path_accounts", "/api/new_address") or "/api/new_address"),
+            str(config.get("cloudflare_path_token", "/api/token") or "/api/token"),
+            str(config.get("cloudflare_path_messages", "/api/mails") or "/api/mails"),
+        ]
+    )
+
+
+def format_cloud_mail_paths_value():
+    # 界面仍用 4 段展示：domains 占位 + accounts + token + messages
+    return ",".join(
+        [
+            "-",
+            str(config.get("cloud_mail_path_accounts", "/api/public/addUser") or "/api/public/addUser"),
+            str(config.get("cloud_mail_path_token", "/api/public/genToken") or "/api/public/genToken"),
+            str(config.get("cloud_mail_path_messages", "/api/public/emailList") or "/api/public/emailList"),
+        ]
+    )
+
+
+def parse_path_csv(raw, expected=4):
+    parts = [x.strip() for x in str(raw or "").split(",") if x.strip()]
+    normalized = []
+    for part in parts:
+        if part == "-":
+            normalized.append(part)
+        else:
+            normalized.append(part if part.startswith("/") else f"/{part}")
+    return normalized
+
+
+def get_email_and_token(api_key=None, log_callback=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
+    if is_cloud_mail_provider(provider):
+        return cloud_mail_create_address(log_callback=log_callback)
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
@@ -1033,6 +1372,16 @@ def get_oai_code(
             log_callback=log_callback,
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
+        )
+    if is_cloud_mail_provider(provider):
+        return cloud_mail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
         )
     if provider == "cloudflare":
         return cloudflare_get_oai_code(
@@ -1548,8 +1897,25 @@ def start_browser(log_callback=None):
             return browser, page
         except Exception as exc:
             last_exc = exc
+            err_text = str(exc).lower()
+            path_related = any(
+                k in err_text
+                for k in (
+                    "not found",
+                    "no such file",
+                    "executable",
+                    "browser_path",
+                    "无法找到",
+                    "找不到",
+                    "不存在",
+                    "cannot find chrome",
+                    "cannot find browser",
+                )
+            )
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+            if attempt == 1 and path_related and not str(config.get("browser_path", "") or "").strip():
+                raise Exception(BROWSER_PATH_HINT) from exc
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
@@ -1842,7 +2208,7 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
 
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
-    email, dev_token = get_email_and_token()
+    email, dev_token = get_email_and_token(log_callback=log_callback)
     if not email or not dev_token:
         raise Exception("获取邮箱失败")
     if log_callback:
@@ -2792,8 +3158,10 @@ class GrokRegisterGUI:
             )
 
         add_label(0, 0, "邮箱服务商:")
-        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_var = tk.StringVar(value=get_email_provider())
+        self.email_provider_combo = tk_option_menu(
+            config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "cloud-mail"], width=12
+        )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -2836,34 +3204,48 @@ class GrokRegisterGUI:
         )
         add_field(self.cloudflare_auth_mode_combo, 2, 3, sticky=tk.W)
 
-        add_label(3, 0, "Cloudflare API Base:")
-        self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
+        self.api_base_label = tk_label(config_frame, text="Cloudflare API Base:", bg=UI_PANEL_BG)
+        self.api_base_label.grid(row=3, column=0, sticky=tk.W, padx=(0, 6), pady=3)
+        initial_base = (
+            config.get("cloud_mail_api_base")
+            if is_cloud_mail_provider()
+            else config.get("cloudflare_api_base", "")
+        ) or config.get("cloudflare_api_base", "")
+        self.cloudflare_api_base_var = tk.StringVar(value=str(initial_base or ""))
         self.cloudflare_api_base_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_base_var, width=72)
         add_field(self.cloudflare_api_base_entry, 3, 1, columnspan=3)
 
-        add_label(4, 0, "Cloudflare API Key:")
-        self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
+        self.api_key_label = tk_label(config_frame, text="Cloudflare API Key:", bg=UI_PANEL_BG)
+        self.api_key_label.grid(row=4, column=0, sticky=tk.W, padx=(0, 6), pady=3)
+        initial_key = (
+            config.get("cloud_mail_token")
+            if is_cloud_mail_provider()
+            else config.get("cloudflare_api_key", "")
+        ) or ""
+        self.cloudflare_api_key_var = tk.StringVar(value=str(initial_key or ""))
         self.cloudflare_api_key_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_key_var, width=34)
         add_field(self.cloudflare_api_key_entry, 4, 1)
 
-        add_label(4, 2, "CF 路径:")
+        self.paths_label = tk_label(config_frame, text="CF 路径:", bg=UI_PANEL_BG)
+        self.paths_label.grid(row=4, column=2, sticky=tk.W, padx=(0, 6), pady=3)
         self.cloudflare_paths_var = tk.StringVar(
-            value=",".join(
-                [
-                    config.get("cloudflare_path_domains", "/api/domains"),
-                    config.get("cloudflare_path_accounts", "/api/new_address"),
-                    config.get("cloudflare_path_token", "/api/token"),
-                    config.get("cloudflare_path_messages", "/api/mails"),
-                ]
-            )
+            value=format_cloud_mail_paths_value() if is_cloud_mail_provider() else format_cloudflare_paths_value()
         )
         self.cloudflare_paths_entry = tk_entry(config_frame, textvariable=self.cloudflare_paths_var, width=34)
         add_field(self.cloudflare_paths_entry, 4, 3)
+
+        self.email_provider_var.trace_add("write", lambda *_: self._sync_email_provider_ui())
+        self._sync_email_provider_ui()
 
         add_label(5, 0, "CPA 直出(SSO→auth):")
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
         self.cpa_auto_add_check = tk_checkbutton(config_frame, variable=self.cpa_auto_add_var)
         add_field(self.cpa_auto_add_check, 5, 1, sticky=tk.W)
+
+        add_label(5, 2, "浏览器路径(可选):")
+        self.browser_path_var = tk.StringVar(value=str(config.get("browser_path", "") or ""))
+        self.browser_path_entry = tk_entry(config_frame, textvariable=self.browser_path_var, width=34)
+        add_field(self.browser_path_entry, 5, 3)
 
         add_label(6, 0, "CPA auth 目录:")
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "")))
@@ -2986,6 +3368,28 @@ class GrokRegisterGUI:
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
 
+    def _sync_email_provider_ui(self):
+        provider = normalize_email_provider(self.email_provider_var.get())
+        if provider == "cloud-mail":
+            self.api_base_label.config(text="cloud-mail API Base:")
+            self.api_key_label.config(text="cloud-mail Token:")
+            self.paths_label.config(text="cloud-mail 路径:")
+            if not self.cloudflare_api_base_var.get().strip():
+                self.cloudflare_api_base_var.set(str(config.get("cloud_mail_api_base", "") or ""))
+            if not self.cloudflare_api_key_var.get().strip():
+                self.cloudflare_api_key_var.set(str(config.get("cloud_mail_token", "") or ""))
+            current = self.cloudflare_paths_var.get().strip()
+            if (not current) or current == format_cloudflare_paths_value() or "/api/new_address" in current:
+                self.cloudflare_paths_var.set(format_cloud_mail_paths_value())
+        else:
+            self.api_base_label.config(text="Cloudflare API Base:")
+            self.api_key_label.config(text="Cloudflare API Key:")
+            self.paths_label.config(text="CF 路径:")
+            if provider == "cloudflare":
+                current = self.cloudflare_paths_var.get().strip()
+                if (not current) or current == format_cloud_mail_paths_value() or "/api/public/" in current:
+                    self.cloudflare_paths_var.set(format_cloudflare_paths_value())
+
     def should_stop(self):
         return self.stop_requested or not self.is_running
 
@@ -2994,13 +3398,27 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
 
-        config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
+        provider = normalize_email_provider(self.email_provider_var.get())
+        config["email_provider"] = provider
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
+        config["browser_path"] = self.browser_path_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
-        config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
-        config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
+        base = self.cloudflare_api_base_var.get().strip()
+        key = self.cloudflare_api_key_var.get().strip()
+        if provider == "cloud-mail":
+            config["cloud_mail_api_base"] = base
+            # 输入框为空时保留已有 token，避免点「开始」误清空
+            if key:
+                config["cloud_mail_token"] = key
+            if base:
+                config["cloudflare_api_base"] = base
+            if key:
+                config["cloudflare_api_key"] = key
+        else:
+            config["cloudflare_api_base"] = base
+            config["cloudflare_api_key"] = key
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
@@ -3017,15 +3435,32 @@ class GrokRegisterGUI:
             self.log("[!] Sub2API 每包数量无效")
             return
         config["sub2api_verify"] = bool(self.sub2api_verify_var.get())
-        raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
-        if len(raw_paths) >= 4:
-            config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
-            config["cloudflare_path_accounts"] = raw_paths[1] if raw_paths[1].startswith("/") else ("/" + raw_paths[1])
-            config["cloudflare_path_token"] = raw_paths[2] if raw_paths[2].startswith("/") else ("/" + raw_paths[2])
-            config["cloudflare_path_messages"] = raw_paths[3] if raw_paths[3].startswith("/") else ("/" + raw_paths[3])
+        raw_paths = parse_path_csv(self.cloudflare_paths_var.get())
+        if provider == "cloud-mail":
+            # 4 段: -, accounts, token, messages  或 3 段: accounts, token, messages
+            if len(raw_paths) >= 4:
+                accounts, token_path, messages = raw_paths[1], raw_paths[2], raw_paths[3]
+            elif len(raw_paths) >= 3:
+                accounts, token_path, messages = raw_paths[0], raw_paths[1], raw_paths[2]
+            else:
+                accounts = token_path = messages = ""
+            if accounts and accounts != "-":
+                config["cloud_mail_path_accounts"] = accounts
+            if token_path and token_path != "-":
+                config["cloud_mail_path_token"] = token_path
+            if messages and messages != "-":
+                config["cloud_mail_path_messages"] = messages
+        elif len(raw_paths) >= 4:
+            config["cloudflare_path_domains"] = raw_paths[0]
+            config["cloudflare_path_accounts"] = raw_paths[1]
+            config["cloudflare_path_token"] = raw_paths[2]
+            config["cloudflare_path_messages"] = raw_paths[3]
         save_config()
-        if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
+        if provider == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
+            return
+        if provider == "cloud-mail" and not config.get("cloud_mail_api_base"):
+            self.log("[!] cloud-mail 模式需要先填写 API Base")
             return
         try:
             count = int(self.count_var.get())

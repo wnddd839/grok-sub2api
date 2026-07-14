@@ -637,6 +637,28 @@ def write_sub2api_auth(auth_dir: Path, creds: dict) -> Path:
     return path
 
 
+def _is_jwt(token: str) -> bool:
+    t = str(token or "").strip()
+    return t.startswith("eyJ") and t.count(".") >= 2
+
+
+def _sub2api_admin_headers(token: str) -> dict:
+    """Sub2API admin 鉴权：
+    - JWT (eyJxxx.yyy.zzz) → Authorization: Bearer <jwt>
+    - 静态 admin API Key (admin-xxx / 任意非 JWT) → x-api-key: <key>
+    参考：sub2api admin middleware 接受 x-api-key 头。
+    """
+    token = str(token or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if not token:
+        return headers
+    if _is_jwt(token):
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        headers["x-api-key"] = token
+    return headers
+
+
 def upload_sub2api_account(
     base_url: str,
     admin_token: str,
@@ -647,7 +669,7 @@ def upload_sub2api_account(
     """通过 Sub2API 管理接口创建 Grok OAuth 账号。
 
     POST {base}/api/v1/admin/accounts
-    Header: Authorization: Bearer <admin_token>
+    鉴权：JWT → Authorization: Bearer；静态 admin API Key → x-api-key
     """
     import requests
 
@@ -662,10 +684,7 @@ def upload_sub2api_account(
     url = f"{base}/api/v1/admin/accounts"
     resp = requests.post(
         url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
+        headers=_sub2api_admin_headers(token),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         timeout=timeout,
     )

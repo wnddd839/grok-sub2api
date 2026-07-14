@@ -115,7 +115,7 @@ sub2api_accounts_002.json
 | `sub2api_verify` | 写包前用 CLI 风格请求验活 |
 | `sub2api_verify_workers` | 并行验活线程数 |
 | `sub2api_url` | 远程 Sub2API 根地址（可选） |
-| `sub2api_token` | 远程管理员 Bearer Token（可选；需有效 JWT） |
+| `sub2api_token` | 远程管理员凭证（可选）：JWT → `Authorization: Bearer`；静态 admin API Key → `x-api-key` |
 
 远程创建走 `POST /api/v1/admin/accounts`，Token 无效会 `401 INVALID_TOKEN`，**不影响本地写包**。
 
@@ -123,14 +123,44 @@ sub2api_accounts_002.json
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | `cloudflare` / `duckmail` / `yyds` |
+| `email_provider` | `cloudflare` / `cloud-mail` / `duckmail` / `yyds` |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
 | `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
 | `cloudflare_api_key` | admin 模式填 `ADMIN_PASSWORD`；匿名留空 |
-| `defaultDomains` | 收信域名，多个用逗号分隔 |
+| `cloud_mail_api_base` | cloud-mail 服务根地址（`/api/public/*`） |
+| `cloud_mail_token` | cloud-mail Authorization token（无则用 admin 账密 genToken） |
+| `cloud_mail_admin_email` / `cloud_mail_admin_password` | 用于 `POST /api/public/genToken` |
+| `defaultDomains` | 收信域名，多个用逗号分隔（cloud-mail 创建地址时必填） |
+| `browser_path` | 可选；Chrome/Edge/Chromium 可执行文件路径，留空则自动探测 |
 | `register_count` | 目标注册数量 |
 | `proxy` | HTTP 代理；换 token / 验活也走此代理 |
 | `enable_nsfw` | 注册后尝试开启 NSFW（失败仍会继续导出） |
+
+### cloud-mail 邮箱示例
+
+```json
+{
+  "email_provider": "cloud-mail",
+  "cloud_mail_api_base": "https://你的-mail-域名",
+  "cloud_mail_token": "你的 Authorization token",
+  "cloud_mail_path_token": "/api/public/genToken",
+  "cloud_mail_path_accounts": "/api/public/addUser",
+  "cloud_mail_path_messages": "/api/public/emailList",
+  "defaultDomains": "你的收信域名.com",
+  "browser_path": "",
+  "proxy": "http://127.0.0.1:7890"
+}
+```
+
+无现成 token 时可改配：
+
+```json
+{
+  "cloud_mail_token": "",
+  "cloud_mail_admin_email": "admin@example.com",
+  "cloud_mail_admin_password": "your-password"
+}
+```
 
 ### Cloudflare 邮箱示例
 
