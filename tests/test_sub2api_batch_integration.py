@@ -42,9 +42,12 @@ class Sub2APIBatchIntegrationTests(unittest.TestCase):
             with patch.object(app._s2cpa, "sso_to_token", return_value=token), patch.object(
                 app._s2cpa, "verify_grok_credentials", return_value=(True, "HTTP 200")
             ):
-                app.add_sso_to_sub2api("sso-cookie", email="first@example.com")
+                ok = app.wait_sub2api_account_result(
+                    app.add_sso_to_sub2api("sso-cookie", email="first@example.com")
+                )
                 app.wait_sub2api_pending()
 
+            self.assertTrue(ok)
             package_paths = list(
                 writer.session_dir.glob("sub2api_accounts_*.json")
             )
@@ -87,9 +90,12 @@ class Sub2APIBatchIntegrationTests(unittest.TestCase):
                 "verify_grok_credentials",
                 return_value=(False, "HTTP 401"),
             ):
-                app.add_sso_to_sub2api("sso-cookie", email="dead@example.com")
+                ok = app.wait_sub2api_account_result(
+                    app.add_sso_to_sub2api("sso-cookie", email="dead@example.com")
+                )
                 app.wait_sub2api_pending()
 
+            self.assertFalse(ok)
             self.assertEqual(writer.total_accounts, 0)
             self.assertEqual(list(writer.session_dir.glob("sub2api_accounts_*.json")), [])
 

@@ -28,8 +28,16 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
-# SSO → CLIProxyAPI(CPA) 扁平格式转换（复用 sso_to_auth_json 的 device-flow + 写入器）
+# SSO → CLIProxyAPI(CPA) 扁平格式转换（复用 sso_to_auth_json 的授权码流程 + 写入器）
 import sso_to_auth_json as _s2cpa
+from email_providers import cloudflare as cloudflare_provider
+from email_providers import cloudmail as cloudmail_provider
+from email_providers import duckmail as duckmail_provider
+from email_providers import mailnest as mailnest_provider
+from email_providers import yyds as yyds_provider
+from email_providers.common import extract_verification_code as _extract_code
+from email_providers.common import generate_username as _generate_username
+from email_providers.common import pick_list_payload as _pick_list
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -44,7 +52,13 @@ UI_BUTTON_BG = "#3a3a3a"
 UI_ACTIVE_BG = "#4a6078"
 
 DEFAULT_CONFIG = {
+    "email_provider": "cloudflare",
     "duckmail_api_key": "",
+    "duckmail_api_base": "https://api.duckmail.sbs",
+    "defaultDomains": "",
+    "cloudmail_url": "",
+    "cloudmail_admin_email": "",
+    "cloudmail_password": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
@@ -56,13 +70,18 @@ DEFAULT_CONFIG = {
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
+    "register_workers": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后自动 device-flow 换 token 并写成 CPA 扁平格式
+    # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后自动走授权码流程换 token 并写成 CPA 扁平格式
     "cpa_auto_add": False,
     "cpa_auth_dir": "",
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
+    "mailnest_api_key": "",
+    "mailnest_project_code": "x-ai001",
+    # YYDS：留空自动选已验证域名；填写则固定该域名
+    "yyds_default_domain": "",
     # Sub2API：注册成功后按批次写出导入包 / 可选远程创建账号
     "sub2api_auto_add": False,
     "sub2api_dir": "",
@@ -88,6 +107,79 @@ class RegistrationCancelled(Exception):
 
 class AccountRetryNeeded(Exception):
     pass
+
+
+class EmailDomainRejected(Exception):
+    """xAI 拒绝当前邮箱域名（如公共临时域被拉黑）。"""
+
+    def __init__(self, email="", message=""):
+        self.email = email or ""
+        self.message = message or "邮箱域名已被拒绝"
+        domain = ""
+        if "@" in self.email:
+            domain = self.email.split("@", 1)[1]
+        detail = self.message
+        if domain and domain not in detail:
+            detail = f"{detail}（域名: {domain}）"
+        if self.email and self.email not in detail:
+            detail = f"{detail} | 邮箱: {self.email}"
+        super().__init__(detail)
+
+
+
+FAIL_DOMAIN = "domain_rejected"
+FAIL_CODE = "code_timeout"
+FAIL_BROWSER = "browser"
+FAIL_CPA = "cpa"
+FAIL_VERIFY = "verify"
+FAIL_STUCK = "stuck_retry"
+FAIL_OTHER = "other"
+
+FAIL_LABELS = {
+    FAIL_DOMAIN: "域名拒绝",
+    FAIL_CODE: "验证码超时",
+    FAIL_BROWSER: "浏览器断开",
+    FAIL_CPA: "CPA失败",
+    FAIL_VERIFY: "验活失败",
+    FAIL_STUCK: "流程卡住",
+    FAIL_OTHER: "其它",
+}
+
+
+def classify_failure(exc) -> str:
+    if isinstance(exc, EmailDomainRejected):
+        return FAIL_DOMAIN
+    msg = str(exc or "")
+    low = msg.lower()
+    if isinstance(exc, AccountRetryNeeded) or "达到最大重试" in msg or "流程卡住" in msg:
+        return FAIL_STUCK
+    if "未收到验证码" in msg or "验证码阶段失败" in msg or "验证码" in msg and "失败" in msg:
+        return FAIL_CODE
+    if (
+        "浏览器" in msg
+        or "page disconnected" in low
+        or "与页面的连接已断开" in msg
+        or "PageDisconnected" in msg
+        or "disconnected" in low
+    ):
+        return FAIL_BROWSER
+    if "[CPA]" in msg or "CPA" in msg and ("失败" in msg or "跳过" in msg):
+        return FAIL_CPA
+    if "验活" in msg or "换 token" in msg or "verify" in low:
+        return FAIL_VERIFY
+    return FAIL_OTHER
+
+
+def empty_fail_stats():
+    return {k: 0 for k in FAIL_LABELS}
+
+
+def format_fail_stats(stats: dict) -> str:
+    parts = [f"{FAIL_LABELS.get(k, k)}={stats.get(k, 0)}" for k in FAIL_LABELS if stats.get(k, 0)]
+    if not parts:
+        return "无分类失败"
+    return " | ".join(parts)
+
 
 
 def load_config():
@@ -152,7 +244,7 @@ EXTENSION_PATH = os.path.abspath(
 )
 
 
-DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
+DUCKMAIL_API_BASE_DEFAULT = duckmail_provider.API_BASE_DEFAULT
 
 
 def get_proxies():
@@ -162,8 +254,13 @@ def get_proxies():
     return {}
 
 
+def get_duckmail_api_base():
+    return duckmail_provider.normalize_base(str(config.get("duckmail_api_base", "") or ""))
+
+
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
+
 
 
 def get_cloudflare_api_base():
@@ -179,115 +276,97 @@ def get_cloudflare_auth_mode():
 
 
 def get_cloudflare_custom_auth():
-    """全局访问密码（cloudflare_temp_email 的 PASSWORDS）。
-
-    开启后 Worker 会对除 /open_api、/telegram 外的所有路径校验 x-custom-auth 头，
-    与 cloudflare_auth_mode 正交叠加，需要在每个请求上单独注入。
-    """
+    """全局访问密码（cloudflare_temp_email 的 PASSWORDS）。"""
     return str(config.get("cloudflare_custom_auth", "") or "").strip()
 
 
 def cloudflare_apply_custom_auth(headers):
-    """给请求头注入全局访问密码，若未配置则原样返回。"""
-    custom_auth = get_cloudflare_custom_auth()
-    if custom_auth:
-        headers["x-custom-auth"] = custom_auth
-    return headers
+    return cloudflare_provider.apply_custom_auth(headers, get_cloudflare_custom_auth())
 
 
 def get_cloudflare_path(key, default_path):
-    raw = str(config.get(key, default_path) or default_path).strip()
-    if not raw.startswith("/"):
-        raw = "/" + raw
-    return raw
+    return cloudflare_provider.path_from_config(config, key, default_path)
 
 
 def cloudflare_build_headers(content_type=False):
-    headers = {"Content-Type": "application/json"} if content_type else {}
-    key = get_cloudflare_api_key()
-    mode = get_cloudflare_auth_mode()
-    if key:
-        if mode == "x-api-key":
-            headers["X-API-Key"] = key
-        elif mode == "x-admin-auth":
-            headers["x-admin-auth"] = key
-        elif mode != "none":
-            headers["Authorization"] = f"Bearer {key}"
-    cloudflare_apply_custom_auth(headers)
-    return headers
+    return cloudflare_provider.build_headers(
+        get_cloudflare_api_key(),
+        get_cloudflare_auth_mode(),
+        get_cloudflare_custom_auth(),
+        content_type=content_type,
+    )
 
 
 def cloudflare_apply_auth_params(params=None):
-    merged = dict(params or {})
-    key = get_cloudflare_api_key()
-    mode = get_cloudflare_auth_mode()
-    if key and mode == "query-key":
-        merged["key"] = key
-    return merged
+    return cloudflare_provider.apply_auth_params(
+        params, get_cloudflare_api_key(), get_cloudflare_auth_mode()
+    )
 
 
 def cloudflare_next_default_domain():
-    """按配置轮换选择 Cloudflare 临时邮箱域名。"""
     global _cf_domain_index
     domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
-    if not domains:
-        return ""
-    domain = domains[_cf_domain_index % len(domains)]
-    _cf_domain_index += 1
+    domain, _cf_domain_index = cloudflare_provider.next_default_domain(domains, _cf_domain_index)
     return domain
 
 
 def cloudflare_is_admin_create_path(path):
-    """判断当前创建邮箱路径是否为 cloudflare_temp_email 管理员创建接口。"""
-    return str(path or "").rstrip("/").lower() == "/admin/new_address"
+    return cloudflare_provider.is_admin_create_path(path)
 
 
 def _pick_list_payload(data):
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        if isinstance(data.get("results"), list):
-            return data.get("results")
-        if isinstance(data.get("hydra:member"), list):
-            return data.get("hydra:member")
-        if isinstance(data.get("data"), list):
-            return data.get("data")
-        if isinstance(data.get("messages"), list):
-            return data.get("messages")
-        if isinstance(data.get("data"), dict):
-            nested = data.get("data")
-            if isinstance(nested.get("messages"), list):
-                return nested.get("messages")
-    return []
+    return _pick_list(data)
 
 
 def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。"""
-    path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
-    url = f"{api_base}{path}"
-    domain = cloudflare_next_default_domain()
-    is_admin_create = cloudflare_is_admin_create_path(path)
-    if is_admin_create:
-        payload = {"name": generate_username(10), "enablePrefix": True}
-        if domain:
-            payload["domain"] = domain
-        headers = cloudflare_build_headers(content_type=True)
-    else:
-        payload = {}
-        if domain:
-            payload["domain"] = domain
-        headers = cloudflare_apply_custom_auth({"Content-Type": "application/json"})
-    resp = http_post(url, json=payload, headers=headers)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
-    address = data.get("address")
-    jwt = data.get("jwt")
-    if not address or not jwt:
-        raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
-    return address, jwt
+    return cloudflare_provider.create_temp_address(
+        http_post,
+        api_base,
+        accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/api/new_address"),
+        domain=cloudflare_next_default_domain(),
+        api_key=get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
+        name=generate_username(10),
+    )
+
+
+MAILNEST_API_BASE = mailnest_provider.API_BASE
+MAILNEST_DEFAULT_PROJECT_CODE = mailnest_provider.DEFAULT_PROJECT_CODE
+
+
+def get_mailnest_api_key():
+    key = str(config.get("mailnest_api_key", "") or "").strip()
+    if not key:
+        raise Exception(f"请在配置文件中配置 mailnest_api_key | 注册网址：{MAILNEST_API_BASE}")
+    return key
+
+
+def get_mailnest_project_code():
+    code = str(config.get("mailnest_project_code", "") or "").strip()
+    return code or MAILNEST_DEFAULT_PROJECT_CODE
+
+
+def mailnest_buy_email():
+    return mailnest_provider.buy_email(http_post, get_mailnest_api_key(), get_mailnest_project_code())
+
+
+def mailnest_receive_email(email):
+    return mailnest_provider.receive_email(http_post, get_mailnest_api_key(), email)
+
+
+def mailnest_get_code(email, timeout=180, poll_interval=3, log_callback=None, cancel_callback=None):
+    return mailnest_provider.wait_for_code(
+        http_post,
+        get_mailnest_api_key(),
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
 
 
 def get_user_agent():
@@ -304,16 +383,31 @@ def _normalize_sso_token(raw_token):
     return token
 
 
+def _resolve_cpa_proxy():
+    """CPA 换 token 用的代理：优先 config.proxy，其次环境变量，最后本机 7890。"""
+    proxy = str(config.get("proxy", "") or "").strip()
+    if proxy:
+        return proxy
+    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        val = str(os.environ.get(key, "") or "").strip()
+        if val:
+            return val
+    return "http://127.0.0.1:7890"
+
+
 def begin_sub2api_batch_session(log_callback=None):
-    """为本次注册任务创建独立的 Sub2API 分包目录，并启动并行验活线程池。"""
+    """为本次注册任务启动验活线程池；若开启直出则同时创建分包目录。"""
     global _sub2api_batch_writer, _sub2api_executor, _sub2api_futures
     wait_sub2api_pending(log_callback=log_callback)
     _sub2api_batch_writer = None
-    if not config.get("sub2api_auto_add", False):
+    export_enabled = bool(config.get("sub2api_auto_add", False))
+    verify_enabled = bool(config.get("sub2api_verify", True))
+    out_dir = str(config.get("sub2api_dir", "") or "").strip() if export_enabled else ""
+    remote_url = str(config.get("sub2api_url", "") or "").strip() if export_enabled else ""
+    # 即便不导出，也需要线程池做换 token / 验活（成功门槛）
+    if not export_enabled and not verify_enabled:
         return None
-    out_dir = str(config.get("sub2api_dir", "") or "").strip()
-    remote_url = str(config.get("sub2api_url", "") or "").strip()
-    if not out_dir and not remote_url:
+    if export_enabled and not out_dir and not remote_url and not verify_enabled:
         return None
     try:
         batch_size = max(int(config.get("sub2api_batch_size", 20) or 20), 1)
@@ -342,8 +436,10 @@ def begin_sub2api_batch_session(log_callback=None):
                     f"[Sub2API] 新批次目录: {_sub2api_batch_writer.session_dir} "
                     f"（每包 {batch_size} 个，验活并发 {workers}）"
                 )
-            else:
+            elif remote_url:
                 log_callback(f"[Sub2API] 远程直推已启用（验活并发 {workers}）")
+            else:
+                log_callback(f"[Sub2API] 验活线程池已启动（并发 {workers}，成功以验活为准）")
         return _sub2api_batch_writer
     except Exception as exc:
         if log_callback:
@@ -370,15 +466,19 @@ def wait_sub2api_pending(log_callback=None):
 
 
 def add_sso_to_cpa(raw_token, email="", log_callback=None):
-    """SSO → device-flow 换 token → 写入本地 CPA auth 目录和/或远程 CPA。
+    """SSO → 换 token → 写入本地 CPA auth 目录和/或远程 CPA。
 
-    SSO 本身不是 CPA 认的凭据；必须先用 device flow 换到 access/refresh token，
-    再写成 CPA 的 xai-<email>.json（上游原生：cli-chat-proxy + grok-cli headers）。
+    SSO 本身不是 CPA 认的凭据；必须先换到 access/refresh token，
+    再写成 CPA 的 xai-<email>.json（type=xai + cli-chat-proxy base_url + grok-cli headers）。
+    实际的 SSO→token 换取流程由 sso_to_auth_json(_s2cpa) 决定（当前为 Device Flow）。
 
     - 本地：写入 cpa_auth_dir，CPA 监听热加载
     - 远程：POST Management API /v0/management/auth-files（cpa_remote_url + cpa_management_key）
+    - cpa_auto_add=false 时跳过转换，仅保留 accounts 文件里的 SSO
     """
     if not config.get("cpa_auto_add", False):
+        if log_callback:
+            log_callback("[*] 已关闭 SSO→CPA auth，仅保存 SSO（不写 auth）")
         return
     auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
@@ -396,7 +496,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
     sso = _normalize_sso_token(raw_token)
     if not sso:
         return
-    proxy = str(config.get("proxy", "") or "").strip()
+    proxy = _resolve_cpa_proxy()
 
     def _cpa_log(message):
         if log_callback:
@@ -409,12 +509,33 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
             log_callback(f"[CPA] {text}")
 
     try:
-        _cpa_log("SSO → device-flow 换 token ...")
+        _cpa_log(f"SSO → 换 token (proxy={proxy}) ...")
         token = _s2cpa.sso_to_token(sso, proxy=proxy, log=_cpa_log)
         if not token:
-            _cpa_log("device-flow 换 token 失败，跳过")
+            _cpa_log("换 token 失败，跳过")
             return
-        record = _s2cpa.token_to_cpa_record(token, email=email)
+        # 兼容授权码流程（token_to_cpa_record 接受 sso 参数）与 device-flow（不接受）
+        try:
+            import inspect
+
+            _accepts_sso = "sso" in inspect.signature(
+                _s2cpa.token_to_cpa_record
+            ).parameters
+        except (TypeError, ValueError):
+            _accepts_sso = False
+        if _accepts_sso:
+            record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
+        else:
+            record = _s2cpa.token_to_cpa_record(token, email=email)
+        try:
+            ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
+            ref = ap.get("referrer")
+            if ref == "grok-build":
+                _cpa_log("access_token referrer=grok-build OK")
+            elif ref:
+                _cpa_log(f"提示: access_token referrer={ref!r}")
+        except Exception:
+            pass
         if auth_dir:
             try:
                 path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
@@ -432,30 +553,43 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
 
 
 def add_sso_to_sub2api(raw_token, email="", log_callback=None):
-    """SSO → device-flow →（可选并行验活）→ 写导入包 / 远程创建。
+    """SSO → 换 token → 验活 →（可选）写导入包 / 远程创建。
 
-    验活与导出在线程池中执行，不阻塞浏览器注册主循环。
+    返回 Future[bool]：仅当换 token 成功，且（未开验活或验活通过）时为 True。
+    注册主流程应 future.result() 后再计入成功；仅拿到 SSO 不算成功。
     """
     global _sub2api_batch_writer, _sub2api_executor
-    if not config.get("sub2api_auto_add", False):
-        return
-    out_dir = str(config.get("sub2api_dir", "") or "").strip()
-    remote_url = str(config.get("sub2api_url", "") or "").strip()
-    admin_token = str(config.get("sub2api_token", "") or "").strip()
-    if not out_dir and not remote_url:
-        if log_callback:
-            log_callback("[Debug] 已开启 Sub2API 直出但未配置 sub2api_dir 或 sub2api_url，跳过")
-        return
-    if remote_url and not admin_token:
-        if log_callback:
-            log_callback("[Debug] 已配置 sub2api_url 但未配置 sub2api_token，跳过远程创建")
-        remote_url = ""
-    if not out_dir and not remote_url:
-        return
+    from concurrent.futures import Future
+
+    def _done(ok: bool) -> Future:
+        fut = Future()
+        fut.set_result(bool(ok))
+        return fut
+
     sso = _normalize_sso_token(raw_token)
     if not sso:
-        return
+        return _done(False)
+
+    export_enabled = bool(config.get("sub2api_auto_add", False))
+    out_dir = str(config.get("sub2api_dir", "") or "").strip() if export_enabled else ""
+    remote_url = str(config.get("sub2api_url", "") or "").strip() if export_enabled else ""
+    admin_token = str(config.get("sub2api_token", "") or "").strip()
+    if export_enabled:
+        if not out_dir and not remote_url:
+            if log_callback:
+                log_callback(
+                    "[Debug] 已开启 Sub2API 直出但未配置 sub2api_dir 或 sub2api_url，仅验活不计导出"
+                )
+        if remote_url and not admin_token:
+            if log_callback:
+                log_callback("[Debug] 已配置 sub2api_url 但未配置 sub2api_token，跳过远程创建")
+            remote_url = ""
+        if not out_dir and not remote_url:
+            # 仍做换 token + 验活，作为成功门槛
+            pass
+
     proxy = str(config.get("proxy", "") or "").strip()
+    # 默认验活；关闭后改为「换 token 成功」即算通过
     verify_enabled = bool(config.get("sub2api_verify", True))
 
     def _s2_log(message):
@@ -467,17 +601,13 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None):
                 text = text.encode("gbk", errors="replace").decode("gbk")
             log_callback(f"[Sub2API] {text}")
 
-    if (
+    if export_enabled and out_dir and (
         _sub2api_executor is None
-        or (
-            out_dir
-            and (
-                _sub2api_batch_writer is None
-                or _sub2api_batch_writer.output_root.resolve()
-                != _s2cpa.Path(out_dir).resolve()
-            )
-        )
+        or _sub2api_batch_writer is None
+        or _sub2api_batch_writer.output_root.resolve() != _s2cpa.Path(out_dir).resolve()
     ):
+        begin_sub2api_batch_session(log_callback=log_callback)
+    elif _sub2api_executor is None and (verify_enabled or export_enabled):
         begin_sub2api_batch_session(log_callback=log_callback)
 
     job = {
@@ -488,70 +618,84 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None):
         "remote_url": remote_url,
         "admin_token": admin_token,
         "verify_enabled": verify_enabled,
+        "export_enabled": export_enabled and bool(out_dir or remote_url),
     }
 
-    def _worker(payload):
+    def _worker(payload) -> bool:
         label = payload["email"] or "account"
         try:
-            _s2_log(f"{label}: SSO → device-flow 换 token ...")
+            _s2_log(f"{label}: SSO → 换 token ...")
             token = _s2cpa.sso_to_token(
                 payload["sso"], proxy=payload["proxy"], log=_s2_log
             )
             if not token:
-                _s2_log(f"{label}: device-flow 换 token 失败，跳过")
-                return
+                _s2_log(f"{label}: 换 token 失败")
+                return False
             creds = _s2cpa.token_to_sub2api_credentials(
                 token, email=payload["email"]
             )
             if payload["verify_enabled"]:
-                _s2_log(f"{label}: 并行验活中 ...")
+                _s2_log(f"{label}: 验活中 ...")
                 ok, message = _s2cpa.verify_grok_credentials(
                     creds, proxy=payload["proxy"]
                 )
                 if not ok:
-                    _s2_log(f"{label}: 验活失败，跳过导出 ({message})")
-                    return
+                    _s2_log(f"{label}: 验活失败 ({message})")
+                    return False
                 _s2_log(f"{label}: 验活通过 ({message})")
-            with _sub2api_io_lock:
-                if payload["out_dir"]:
-                    writer = _sub2api_batch_writer
-                    if writer is None:
-                        raise RuntimeError("未能创建 Sub2API 批次写入器")
-                    result = writer.add_credentials(creds, name=payload["email"])
-                    _s2_log(
-                        f"{label}: 已写入第 {result['package_index']:03d} 包 "
-                        f"({result['position']}/{result['batch_size']}): {result['path']}"
-                    )
-                if payload["remote_url"]:
-                    created = _s2cpa.upload_sub2api_account(
-                        payload["remote_url"],
-                        payload["admin_token"],
-                        creds,
-                        name=payload["email"],
-                    )
-                    created_id = ""
-                    if isinstance(created, dict):
-                        data = (
-                            created.get("data")
-                            if isinstance(created.get("data"), dict)
-                            else created
+            if payload["export_enabled"]:
+                with _sub2api_io_lock:
+                    if payload["out_dir"]:
+                        writer = _sub2api_batch_writer
+                        if writer is None:
+                            raise RuntimeError("未能创建 Sub2API 批次写入器")
+                        result = writer.add_credentials(creds, name=payload["email"])
+                        _s2_log(
+                            f"{label}: 已写入第 {result['package_index']:03d} 包 "
+                            f"({result['position']}/{result['batch_size']}): {result['path']}"
                         )
-                        created_id = str((data or {}).get("id") or "")
-                    _s2_log(
-                        f"{label}: 已创建远程账号"
-                        f"{(' id=' + created_id) if created_id else ''}"
-                    )
+                    if payload["remote_url"]:
+                        created = _s2cpa.upload_sub2api_account(
+                            payload["remote_url"],
+                            payload["admin_token"],
+                            creds,
+                            name=payload["email"],
+                        )
+                        created_id = ""
+                        if isinstance(created, dict):
+                            data = (
+                                created.get("data")
+                                if isinstance(created.get("data"), dict)
+                                else created
+                            )
+                            created_id = str((data or {}).get("id") or "")
+                        _s2_log(
+                            f"{label}: 已创建远程账号"
+                            f"{(' id=' + created_id) if created_id else ''}"
+                        )
+            return True
         except Exception as exc:
             _s2_log(f"{label}: 直出失败: {exc}")
+            return False
 
     executor = _sub2api_executor
     if executor is None:
-        _worker(job)
-        return
+        return _done(_worker(job))
     future = executor.submit(_worker, job)
     with _sub2api_futures_lock:
         _sub2api_futures.append(future)
-    _s2_log(f"{email or 'account'}: 已提交并行验活/导出")
+    _s2_log(f"{email or 'account'}: 已提交换 token/验活")
+    return future
+
+
+def wait_sub2api_account_result(future, timeout=None) -> bool:
+    """等待单账号验活 Future；失败或异常视为 False。"""
+    if future is None:
+        return False
+    try:
+        return bool(future.result(timeout=timeout))
+    except Exception:
+        return False
 
 
 def create_browser_options():
@@ -599,6 +743,18 @@ def http_post(url, **kwargs):
         raise
 
 
+def http_delete(url, **kwargs):
+    try:
+        return requests.delete(url, **_build_request_kwargs(**kwargs))
+    except Exception as exc:
+        err = str(exc)
+        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["proxies"] = {}
+            return requests.delete(url, **_build_request_kwargs(**retry_kwargs))
+        raise
+
+
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
         raise RegistrationCancelled("用户停止注册")
@@ -615,137 +771,115 @@ def sleep_with_cancel(seconds, cancel_callback=None):
 
 
 def get_domains(api_key=None):
-    headers = {}
-    key = api_key or get_duckmail_api_key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    resp = http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("hydra:member", [])
+    return duckmail_provider.get_domains(
+        http_get,
+        get_duckmail_api_base(),
+        api_key=api_key or get_duckmail_api_key(),
+    )
 
 
 def create_account(address, password, api_key=None, expires_in=0):
-    headers = {"Content-Type": "application/json"}
-    key = api_key or get_duckmail_api_key()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    data = {"address": address, "password": password, "expiresIn": expires_in}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
+    return duckmail_provider.create_account(
+        http_post,
+        get_duckmail_api_base(),
+        address,
+        password,
+        api_key=api_key or get_duckmail_api_key(),
+        expires_in=expires_in,
+    )
 
 
 def get_token(address, password):
-    data = {"address": address, "password": password}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/token", json=data)
-    resp.raise_for_status()
-    return resp.json().get("token")
+    return duckmail_provider.get_token(
+        http_post,
+        get_duckmail_api_base(),
+        address,
+        password,
+    )
 
 
 def get_messages(token):
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("hydra:member", [])
+    return duckmail_provider.get_messages(
+        http_get,
+        get_duckmail_api_base(),
+        token,
+    )
 
 
 def get_message_detail(token, message_id):
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers)
-    resp.raise_for_status()
-    return resp.json()
+    return duckmail_provider.get_message_detail(
+        http_get,
+        get_duckmail_api_base(),
+        token,
+        message_id,
+    )
+
 
 
 def cloudflare_get_domains(api_base, api_key=None):
-    headers = cloudflare_build_headers(content_type=False)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    path = get_cloudflare_path("cloudflare_path_domains", "/domains")
-    params = cloudflare_apply_auth_params()
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
-    resp.raise_for_status()
-    return _pick_list_payload(resp.json())
+    return cloudflare_provider.get_domains(
+        http_get,
+        api_base,
+        domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
+        api_key=api_key or get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
+    )
 
 
 def cloudflare_create_account(api_base, address, password, api_key=None, expires_in=0):
-    headers = cloudflare_build_headers(content_type=True)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    payload = {"address": address, "password": password, "expiresIn": expires_in}
-    path = get_cloudflare_path("cloudflare_path_accounts", "/accounts")
-    params = cloudflare_apply_auth_params()
-    resp = http_post(f"{api_base}{path}", json=payload, headers=headers, params=params)
-    resp.raise_for_status()
-    return resp.json()
+    return cloudflare_provider.create_account(
+        http_post,
+        api_base,
+        address,
+        password,
+        accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
+        api_key=api_key or get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
+        expires_in=expires_in,
+    )
 
 
 def cloudflare_get_token(api_base, address, password, api_key=None):
-    headers = cloudflare_build_headers(content_type=True)
-    if api_key and "Authorization" in headers:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if api_key and "X-API-Key" in headers:
-        headers["X-API-Key"] = api_key
-    path = get_cloudflare_path("cloudflare_path_token", "/token")
-    resp = http_post(
-        f"{api_base}{path}",
-        json={"address": address, "password": password},
-        headers=headers,
-        params=cloudflare_apply_auth_params(),
+    return cloudflare_provider.get_token(
+        http_post,
+        api_base,
+        address,
+        password,
+        token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
+        api_key=api_key or get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
     )
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict):
-        if data.get("token"):
-            return data.get("token")
-        if isinstance(data.get("data"), dict) and data["data"].get("token"):
-            return data["data"].get("token")
-    return None
 
 
 def cloudflare_get_messages(api_base, token):
-    headers = cloudflare_apply_custom_auth({"Authorization": f"Bearer {token}"})
-    path = get_cloudflare_path("cloudflare_path_messages", "/messages")
-    params = {"limit": 20, "offset": 0}
-    params = cloudflare_apply_auth_params(params)
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare messages 返回非JSON: {resp.text[:300]}")
-    return _pick_list_payload(data)
+    return cloudflare_provider.get_messages(
+        http_get,
+        api_base,
+        token,
+        messages_path=get_cloudflare_path("cloudflare_path_messages", "/messages"),
+        api_key=get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
+    )
 
 
 def cloudflare_get_message_detail(api_base, token, message_id):
-    headers = cloudflare_apply_custom_auth({"Authorization": f"Bearer {token}"})
-    candidates = [
-        f"{api_base}/api/mail/{message_id}",
-        f"{api_base}{get_cloudflare_path('cloudflare_path_messages', '/messages')}/{message_id}",
-    ]
-    last_err = None
-    for url in candidates:
-        try:
-            resp = http_get(
-                url,
-                headers=headers,
-                params=cloudflare_apply_auth_params(),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                return data["data"]
-            return data
-        except Exception as exc:
-            last_err = exc
-            continue
-    raise Exception(f"Cloudflare 获取邮件详情失败: {last_err}")
+    return cloudflare_provider.get_message_detail(
+        http_get,
+        api_base,
+        token,
+        message_id,
+        messages_path=get_cloudflare_path("cloudflare_path_messages", "/messages"),
+        api_key=get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
+    )
 
 
-YYDS_API_BASE = "https://maliapi.215.im/v1"
+YYDS_API_BASE = yyds_provider.API_BASE
 
 
 def get_yyds_api_key():
@@ -756,116 +890,54 @@ def get_yyds_jwt():
     return config.get("yyds_jwt", "")
 
 
+def get_yyds_default_domain():
+    return str(config.get("yyds_default_domain", "") or "").strip()
+
+
 def yyds_get_domains(api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/domains", headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data", []) if data.get("success") else []
+    return yyds_provider.get_domains(http_get, api_key=api_key or get_yyds_api_key(), jwt=jwt or get_yyds_jwt())
 
 
-def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
-    payload = {}
-    if address:
-        payload["address"] = address
-    if domain:
-        payload["domain"] = domain
-    elif key or token:
-        payload["autoDomainStrategy"] = "prefer_owned"
-    resp = http_post(f"{YYDS_API_BASE}/accounts", json=payload, headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {})
-    raise Exception(f"YYDS 创建邮箱失败: {data}")
+def yyds_create_account(local_part=None, domain=None, api_key=None, jwt=None):
+    return yyds_provider.create_account(
+        http_post,
+        local_part=local_part or "",
+        domain=domain or "",
+        api_key=api_key or get_yyds_api_key(),
+        jwt=jwt or get_yyds_jwt(),
+    )
 
 
 def yyds_get_token(address, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    token = jwt or get_yyds_jwt()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_post(
-        f"{YYDS_API_BASE}/token", json={"address": address}, headers=headers
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {}).get("token")
-    raise Exception(f"YYDS 获取token失败: {data}")
+    return yyds_provider.get_token(http_post, address, api_key=api_key or get_yyds_api_key(), jwt=jwt or get_yyds_jwt())
 
 
 def yyds_get_messages(address, token=None, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    temp_token = token or jwt or get_yyds_jwt()
-    headers = {}
-    if temp_token:
-        headers["Authorization"] = f"Bearer {temp_token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_get(
-        f"{YYDS_API_BASE}/messages",
-        params={"address": address},
-        headers=headers,
+    return yyds_provider.get_messages(
+        http_get,
+        address,
+        token=token or "",
+        api_key=api_key or get_yyds_api_key(),
+        jwt=jwt or get_yyds_jwt(),
     )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {}).get("messages", [])
-    return []
 
 
 def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
-    key = api_key or get_yyds_api_key()
-    temp_token = token or jwt or get_yyds_jwt()
-    headers = {}
-    if temp_token:
-        headers["Authorization"] = f"Bearer {temp_token}"
-    elif key:
-        headers["X-API-Key"] = key
-    resp = http_get(f"{YYDS_API_BASE}/messages/{message_id}", headers=headers)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("success"):
-        return data.get("data", {})
-    raise Exception(f"YYDS 获取邮件详情失败: {data}")
+    return yyds_provider.get_message_detail(
+        http_get,
+        message_id,
+        token=token or "",
+        api_key=api_key or get_yyds_api_key(),
+        jwt=jwt or get_yyds_jwt(),
+    )
 
 
 def yyds_generate_username(length=10):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
+    return yyds_provider.generate_username(length)
 
 
 def yyds_pick_domain(api_key=None, jwt=None):
-    domains = yyds_get_domains(api_key=api_key, jwt=jwt)
-    if not domains:
-        raise Exception("YYDS 没有返回任何可用域名")
-    private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
-    if private:
-        return private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified") and d.get("isPublic")]
-    if public:
-        return public[0]["domain"]
-    verified = [d for d in domains if d.get("isVerified")]
-    if verified:
-        return verified[0]["domain"]
-    raise Exception("YYDS 无已验证域名可用")
+    return yyds_provider.pick_domain(http_get, api_key=api_key or get_yyds_api_key(), jwt=jwt or get_yyds_jwt())
 
 
 def yyds_get_email_and_token(api_key=None, jwt=None):
@@ -873,10 +945,10 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     token = jwt or get_yyds_jwt()
     if not token and not key:
         raise Exception("YYDS API Key 或 JWT 未配置")
-    domain = yyds_pick_domain(api_key=key, jwt=token)
+    domain = get_yyds_default_domain() or yyds_pick_domain(api_key=key, jwt=token)
     username = yyds_generate_username(10)
     result = yyds_create_account(
-        address=username, domain=domain, api_key=key, jwt=token
+        local_part=username, domain=domain, api_key=key, jwt=token
     )
     address = result.get("address") or f"{username}@{domain}"
     temp_token = result.get("token")
@@ -888,87 +960,92 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     return address, temp_token
 
 
-def yyds_get_oai_code(
-    token,
-    address,
-    timeout=180,
-    poll_interval=3,
-    log_callback=None,
-    jwt=None,
-    cancel_callback=None,
-):
-    deadline = time.time() + timeout
-    seen_ids = set()
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        try:
-            messages = yyds_get_messages(address, token=token, jwt=jwt)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] YYDS 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        for msg in messages:
-            msg_id = msg.get("id")
-            if not msg_id or msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-            to_addrs = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            if address.lower() not in to_addrs:
-                continue
-            try:
-                detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
-                continue
-            parts = []
-            text_body = detail.get("text") or ""
-            if text_body:
-                parts.append(text_body)
-            html_list = detail.get("html") or []
-            for h in html_list:
-                parts.append(re.sub(r"<[^>]+>", " ", h))
-            combined = "\n".join(parts)
-            subject = detail.get("subject", "")
-            if log_callback:
-                log_callback(f"[Debug] YYDS 收到邮件: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] YYDS 从邮件中提取到验证码: {code}")
-                return code
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
+def yyds_get_oai_code(token, address, timeout=180, poll_interval=3, log_callback=None, jwt=None, cancel_callback=None):
+    return yyds_provider.wait_for_code(
+        http_get,
+        token,
+        address,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        jwt=jwt or get_yyds_jwt(),
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
+
 
 
 def generate_username(length=10):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
+    return _generate_username(length)
 
 
 def pick_domain(api_key=None):
-    domains = get_domains(api_key=api_key)
-    if not domains:
-        raise Exception("DuckMail 没有返回任何可用域名")
-    private = [d for d in domains if d.get("ownerId")]
-    verified_private = [d for d in private if d.get("isVerified")]
-    if verified_private:
-        return verified_private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified")]
-    if public:
-        return public[0]["domain"]
-    raise Exception("DuckMail 无已验证域名可用")
+    return duckmail_provider.pick_domain(get_domains(api_key=api_key))
+
+
+def get_cloudmail_url():
+    return str(os.environ.get("CLOUDMAIL_URL") or config.get("cloudmail_url", "") or "").strip().rstrip("/")
+
+
+def get_cloudmail_admin_email():
+    return str(os.environ.get("CLOUDMAIL_ADMIN_EMAIL") or config.get("cloudmail_admin_email", "") or "").strip()
+
+
+def get_cloudmail_password():
+    return str(os.environ.get("CLOUDMAIL_PASSWORD") or config.get("cloudmail_password", "") or "")
+
+
+def cloudmail_get_email_and_token():
+    raw_domains = str(config.get("defaultDomains", "") or "")
+    domains = [item.strip() for item in re.split(r"[,，\s]+", raw_domains) if item.strip()]
+    return cloudmail_provider.create_mailbox(
+        http_post,
+        get_cloudmail_url(),
+        get_cloudmail_admin_email(),
+        get_cloudmail_password(),
+        domains,
+        username=generate_username(10),
+    )
+
+
+def cloudmail_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    del dev_token
+    return cloudmail_provider.wait_for_code(
+        http_post,
+        http_delete,
+        get_cloudmail_url(),
+        get_cloudmail_admin_email(),
+        get_cloudmail_password(),
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
 
 
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    return config.get("email_provider", "cloudflare")
 
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
+    if provider == "cloudmail":
+        return cloudmail_get_email_and_token()
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
@@ -977,41 +1054,29 @@ def get_email_and_token(api_key=None):
             # cloudflare_temp_email 专用模式
             return cloudflare_create_temp_address(api_base)
         except Exception as primary_exc:
-            # new_address / admin 创建失败时不要回退 Mail.tm 风格接口，
-            # 否则 /api/domains 的 401 会掩盖真实错误（如域名配错）。
-            create_path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
-            if create_path.rstrip("/").lower().endswith("/new_address"):
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}") from primary_exc
-            # 兜底回退到 Mail.tm 风格
-            key = api_key or get_cloudflare_api_key()
-            domains = cloudflare_get_domains(api_base, api_key=key)
-            if not domains:
+            try:
+                return cloudflare_provider.create_mailbox_fallback(
+                    http_get,
+                    http_post,
+                    api_base,
+                    domains_path=get_cloudflare_path("cloudflare_path_domains", "/domains"),
+                    accounts_path=get_cloudflare_path("cloudflare_path_accounts", "/accounts"),
+                    token_path=get_cloudflare_path("cloudflare_path_token", "/token"),
+                    api_key=api_key or get_cloudflare_api_key(),
+                    auth_mode=get_cloudflare_auth_mode(),
+                    custom_auth=get_cloudflare_custom_auth(),
+                )
+            except Exception:
                 raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-            verified = [d for d in domains if d.get("isVerified")]
-            target = verified[0] if verified else domains[0]
-            domain = target.get("domain")
-            if not domain:
-                raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-            username = generate_username(10)
-            address = f"{username}@{domain}"
-            password = secrets.token_urlsafe(12)
-            cloudflare_create_account(
-                api_base, address, password, api_key=key, expires_in=0
-            )
-            token = cloudflare_get_token(api_base, address, password, api_key=key)
-            if not token:
-                raise Exception("获取 Cloudflare 邮箱 token 失败")
-            return address, token
-    key = api_key or get_duckmail_api_key()
-    domain = pick_domain(api_key=key)
-    username = generate_username(10)
-    address = f"{username}@{domain}"
-    password = secrets.token_urlsafe(12)
-    create_account(address, password, api_key=key, expires_in=0)
-    token = get_token(address, password)
-    if not token:
-        raise Exception("获取 DuckMail token 失败")
-    return address, token
+    if provider == "mailnest":
+        return mailnest_buy_email(), "_"
+    return duckmail_provider.create_mailbox(
+        http_get,
+        http_post,
+        get_duckmail_api_base(),
+        api_key=api_key or get_duckmail_api_key(),
+        expires_in=0,
+    )
 
 
 def get_oai_code(
@@ -1034,6 +1099,16 @@ def get_oai_code(
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
         )
+    if provider == "cloudmail":
+        return cloudmail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "cloudflare":
         return cloudflare_get_oai_code(
             dev_token,
@@ -1043,6 +1118,14 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+        )
+    if provider == "mailnest":
+        return mailnest_get_code(
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -1054,24 +1137,9 @@ def get_oai_code(
     )
 
 
+
 def extract_verification_code(text, subject=""):
-    if subject:
-        match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    match = re.search(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    patterns = [
-        r"verification\s+code[:\s]+(\d{4,8})",
-        r"your\s+code[:\s]+(\d{4,8})",
-        r"confirm(?:ation)?\s+code[:\s]+(\d{4,8})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
+    return _extract_code(text, subject)
 
 
 def duckmail_get_oai_code(
@@ -1082,49 +1150,19 @@ def duckmail_get_oai_code(
     log_callback=None,
     cancel_callback=None,
 ):
-    deadline = time.time() + timeout
-    seen_ids = set()
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        try:
-            messages = get_messages(dev_token)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        for msg in messages:
-            msg_id = msg.get("id") or msg.get("msgid")
-            if not msg_id or msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
-            recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            if email.lower() not in recipients:
-                continue
-            try:
-                detail = get_message_detail(dev_token, msg_id)
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] 获取邮件详情失败: {exc}")
-                continue
-            parts = []
-            text_body = detail.get("text") or ""
-            if text_body:
-                parts.append(text_body)
-            html_list = detail.get("html") or []
-            for h in html_list:
-                parts.append(re.sub(r"<[^>]+>", " ", h))
-            combined = "\n".join(parts)
-            subject = detail.get("subject", "")
-            if log_callback:
-                log_callback(f"[Debug] 收到邮件: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] 从邮件中提取到验证码: {code}")
-                return code
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"在 {timeout}s 内未收到验证码邮件")
+    return duckmail_provider.wait_for_code(
+        http_get,
+        get_duckmail_api_base(),
+        dev_token,
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        extract_code=extract_verification_code,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
 
 
 def cloudflare_get_oai_code(
@@ -1136,94 +1174,23 @@ def cloudflare_get_oai_code(
     cancel_callback=None,
     resend_callback=None,
 ):
-    api_base = get_cloudflare_api_base()
-    if not api_base:
-        raise Exception("Cloudflare API Base 未配置")
-    deadline = time.time() + timeout
-    # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
-    seen_attempts = {}
-    next_resend_at = time.time() + 35
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        if resend_callback and time.time() >= next_resend_at:
-            try:
-                resend_callback()
-                if log_callback:
-                    log_callback("[*] 已触发重新发送验证码")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] 触发重发验证码失败: {exc}")
-            next_resend_at = time.time() + 35
-        try:
-            messages = cloudflare_get_messages(api_base, dev_token)
-        except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
-            continue
-        if log_callback:
-            log_callback(f"[Debug] Cloudflare 本轮邮件数量: {len(messages)}")
-
-        for msg in messages:
-            msg_id = msg.get("id") or msg.get("msgid")
-            if not msg_id:
-                continue
-            attempt = int(seen_attempts.get(msg_id, 0))
-            if attempt >= 5:
-                continue
-            seen_attempts[msg_id] = attempt + 1
-            recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            msg_addr = str(msg.get("address", "")).lower()
-            # 优先匹配目标邮箱；若结构不一致也允许继续解析，避免接口字段漂移导致漏码
-            address_matched = True
-            if recipients:
-                address_matched = email.lower() in recipients
-            elif msg_addr:
-                address_matched = msg_addr == email.lower()
-            if not address_matched and log_callback:
-                log_callback(f"[Debug] 跳过疑似非目标邮件 id={msg_id} address={msg_addr} to={recipients}")
-                continue
-            parts = []
-            # 先直接从列表项取内容，避免 detail 接口差异导致漏码
-            for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                value = msg.get(field)
-                if isinstance(value, str) and value.strip():
-                    parts.append(value)
-            html_list = msg.get("html") or []
-            if isinstance(html_list, str):
-                html_list = [html_list]
-            for h in html_list:
-                parts.append(re.sub(r"<[^>]+>", " ", h))
-            subject = str(msg.get("subject", "") or "")
-            combined = "\n".join(parts)
-            # 再尝试 detail 接口补全内容
-            try:
-                detail = cloudflare_get_message_detail(api_base, dev_token, msg_id)
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                    value = detail.get(field)
-                    if isinstance(value, str) and value.strip():
-                        combined += "\n" + value
-                html_list2 = detail.get("html") or []
-                if isinstance(html_list2, str):
-                    html_list2 = [html_list2]
-                for h in html_list2:
-                    combined += "\n" + re.sub(r"<[^>]+>", " ", h)
-                if not subject:
-                    subject = str(detail.get("subject", "") or "")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
-            if log_callback:
-                log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
-            code = extract_verification_code(combined, subject)
-            if code:
-                if log_callback:
-                    log_callback(f"[*] Cloudflare 从邮件中提取到验证码: {code}")
-                return code
-            elif log_callback:
-                log_callback(f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[msg_id]}")
-        sleep_with_cancel(poll_interval, cancel_callback)
-    raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")
+    return cloudflare_provider.wait_for_code(
+        http_get,
+        get_cloudflare_api_base(),
+        dev_token,
+        email,
+        messages_path=get_cloudflare_path("cloudflare_path_messages", "/messages"),
+        api_key=get_cloudflare_api_key(),
+        auth_mode=get_cloudflare_auth_mode(),
+        custom_auth=get_cloudflare_custom_auth(),
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
 
 
 def generate_random_birthdate():
@@ -1308,19 +1275,28 @@ def set_birth_date(session, log_callback=None):
     payload = {"birthDate": generate_random_birthdate()}
     try:
         res = session.post(url, json=payload, headers=new_headers, timeout=15)
+        body_preview = response_preview(res)
         if log_callback:
             log_callback(
-                f"[Debug] set_birth_date status: {res.status_code}, body: {response_preview(res)}"
+                f"[Debug] set_birth_date status: {res.status_code}, body: {body_preview}"
             )
         if 200 <= res.status_code < 300:
             return True, "ok"
+        # 生日一旦写过就不能改；算已完成，不能当失败中断后续 NSFW
+        text = str(res.text or "")
+        if res.status_code in (400, 409, 429) and (
+            "birth-date-change-limit-reached" in text
+            or "Birth date is locked" in text
+            or "already set" in text.lower()
+        ):
+            return True, "already_set"
         if is_cloudflare_block_response(res):
             return (
                 False,
                 "set_birth_date 被 grok.com 的 Cloudflare 防护拦截，HTTP "
                 f"{res.status_code}",
             )
-        return False, f"set_birth_date HTTP {res.status_code}: {response_preview(res)}"
+        return False, f"set_birth_date HTTP {res.status_code}: {body_preview}"
     except Exception as e:
         if log_callback:
             log_callback(f"[set_birth_date] 异常: {e}")
@@ -1428,8 +1404,51 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-browser = None
-page = None
+_tls = threading.local()
+
+
+def _active_browser():
+    return getattr(_tls, "browser", None)
+
+
+def _active_page():
+    return getattr(_tls, "page", None)
+
+
+def _set_browser_session(browser_obj=None, page_obj=None):
+    _tls.browser = browser_obj
+    _tls.page = page_obj
+
+
+# 兼容旧代码中的 browser / page 名称（读写走线程本地）
+class _SessionProxy:
+    __slots__ = ("_key",)
+
+    def __init__(self, key):
+        self._key = key
+
+    def _obj(self):
+        return getattr(_tls, self._key, None)
+
+    def __bool__(self):
+        return self._obj() is not None
+
+    def __eq__(self, other):
+        return self._obj() is other
+
+    def __ne__(self, other):
+        return self._obj() is not other
+
+    def __getattr__(self, name):
+        obj = self._obj()
+        if obj is None:
+            raise AttributeError(f"{self._key} is not started")
+        return getattr(obj, name)
+
+
+# 注意：start/stop 必须用 _set_browser_session，不要对 browser/page 直接赋值
+browser = _SessionProxy("browser")
+page = _SessionProxy("page")
 
 
 def setup_light_theme(root):
@@ -1534,38 +1553,36 @@ def tk_option_menu(parent, variable, values, width=12):
 
 
 def start_browser(log_callback=None):
-    global browser, page
     last_exc = None
     for attempt in range(1, 5):
         try:
-            browser = Chromium(create_browser_options())
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
-            if log_callback and getattr(browser, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
+            browser_obj = Chromium(create_browser_options())
+            tabs = browser_obj.get_tabs()
+            page_obj = tabs[-1] if tabs else browser_obj.new_tab()
+            _set_browser_session(browser_obj, page_obj)
+            if log_callback and getattr(browser_obj, "user_data_path", None):
+                log_callback(f"[Debug] 当前浏览器资料目录: {browser_obj.user_data_path}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
-            return browser, page
+            return browser_obj, page_obj
         except Exception as exc:
             last_exc = exc
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                cur = _active_browser()
+                if cur is not None:
+                    cur.quit(del_data=True)
             except Exception:
                 pass
-            browser = None
-            page = None
+            _set_browser_session(None, None)
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
-    current = browser
-    browser = None
-    page = None
+    current = _active_browser()
+    _set_browser_session(None, None)
     if current is None:
         return
     try:
@@ -1597,15 +1614,16 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 
 
 def refresh_active_page():
-    global browser, page
-    if browser is None:
+    if _active_browser() is None:
         restart_browser()
     try:
-        tabs = browser.get_tabs()
+        browser_obj = _active_browser()
+        tabs = browser_obj.get_tabs()
         if tabs:
-            page = tabs[-1]
+            page_obj = tabs[-1]
         else:
-            page = browser.new_tab()
+            page_obj = browser_obj.new_tab()
+        _set_browser_session(browser_obj, page_obj)
     except Exception:
         restart_browser()
     return page
@@ -1650,7 +1668,6 @@ def extract_cf_clearance_and_ua(log_callback=None):
 
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1718,29 +1735,50 @@ return candidates[0].text || true;
 
 
 def open_signup_page(log_callback=None, cancel_callback=None):
-    global browser, page
     raise_if_cancelled(cancel_callback)
-    if browser is None:
-        start_browser()
+    if _active_browser() is None:
+        start_browser(log_callback=log_callback)
         if log_callback:
             log_callback("[*] 浏览器已启动")
+
+    def _navigate_signup():
+        # 优先复用已有标签，避免反复 new_tab 堆积空窗口
+        browser_obj = _active_browser()
+        if browser_obj is None:
+            start_browser(log_callback=log_callback)
+            browser_obj = _active_browser()
+        try:
+            tabs = browser_obj.get_tabs() if browser_obj is not None else []
+            page_obj = tabs[-1] if tabs else browser_obj.new_tab()
+        except Exception:
+            page_obj = browser_obj.new_tab()
+        _set_browser_session(browser_obj, page_obj)
+        page_obj.get(SIGNUP_URL)
+        page_obj.wait.doc_loaded()
+        # 确认真的进了注册域；about:blank / 错页直接失败
+        current = str(getattr(page_obj, "url", "") or "")
+        if "accounts.x.ai" not in current and "x.ai" not in current:
+            raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
+
     try:
-        page = browser.get_tab(0)
-        page.get(SIGNUP_URL)
+        _navigate_signup()
     except Exception as e:
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
         try:
-            page = browser.new_tab(SIGNUP_URL)
+            restart_browser(log_callback=log_callback)
+            _navigate_signup()
         except Exception as e2:
-            if log_callback:
-                log_callback(f"[Debug] 创建新标签页异常: {e2}")
-            restart_browser()
-            page = browser.new_tab(SIGNUP_URL)
-    page.wait.doc_loaded()
+            # 导航彻底失败：关掉残留实例，避免空浏览器挂着
+            try:
+                stop_browser()
+            except Exception:
+                pass
+            raise Exception(f"打开注册页失败: {e2}") from e2
+
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
-        log_callback(f"[*] 当前URL: {page.url}")
+        log_callback(f"[*] 当前URL: {_active_page().url if _active_page() else ''}")
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )
@@ -1763,6 +1801,76 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 
+def detect_email_domain_rejection(email=""):
+    """检测 xAI 是否拒绝当前邮箱域名。
+
+    返回拒绝文案字符串；未检测到则返回空字符串。
+    """
+    if not page:
+        return ""
+    try:
+        result = page.run_js(
+            r"""
+function collectText() {
+    const chunks = [];
+    const selectors = [
+        '[role="alert"]',
+        '[data-testid*="error" i]',
+        '[class*="error" i]',
+        '[class*="Error"]',
+        '[class*="danger" i]',
+        '[class*="invalid" i]',
+        'p', 'span', 'div', 'li', 'label',
+    ];
+    for (const sel of selectors) {
+        for (const node of Array.from(document.querySelectorAll(sel)).slice(0, 80)) {
+            const style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text && text.length >= 8 && text.length <= 400) chunks.push(text);
+        }
+    }
+    const body = (document.body && (document.body.innerText || document.body.textContent) || '')
+        .replace(/\s+/g, ' ').trim();
+    if (body) chunks.push(body.slice(0, 1200));
+    return Array.from(new Set(chunks));
+}
+const texts = collectText();
+const patterns = [
+    /邮箱域名[^。\n]{0,80}被拒绝/,
+    /域名[^。\n]{0,40}已被拒绝/,
+    /已被拒绝[^。\n]{0,40}邮箱/,
+    /email domain[^.\n]{0,80}rejected/i,
+    /domain[^.\n]{0,40}(has been |is )?rejected/i,
+    /please use (a )?different email/i,
+    /use another email address/i,
+    /请使用其他邮箱/,
+    /support@x\.ai/,
+];
+for (const text of texts) {
+    for (const re of patterns) {
+        if (re.test(text)) {
+            const m = text.match(/.{0,40}(拒绝|rejected|different email|其他邮箱).{0,80}/i);
+            return (m && m[0]) || text.slice(0, 180);
+        }
+    }
+}
+return '';
+            """
+        )
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def raise_if_email_domain_rejected(email=""):
+    message = detect_email_domain_rejection(email)
+    if message:
+        raise EmailDomainRejected(email=email, message=message)
+
+
 def _email_page_advanced_once(email):
     """检测邮箱提交后页面是否真正前进（离开邮箱输入阶段）。
 
@@ -1778,6 +1886,8 @@ def _email_page_advanced_once(email):
       - True：页面已前进，提交生效
       - False：仍停留在邮箱输入页
     """
+    # 域名被拒时仍停在邮箱页，优先抛出明确错误
+    raise_if_email_domain_rejected(email)
     try:
         return bool(
             page.run_js(
@@ -1821,6 +1931,8 @@ return false;
                 """
             )
         )
+    except EmailDomainRejected:
+        raise
     except Exception:
         return False
 
@@ -1834,9 +1946,11 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
     deadline = time.time() + wait
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        raise_if_email_domain_rejected(email)
         if _email_page_advanced_once(email):
             return True
         sleep_with_cancel(0.4, cancel_callback)
+    raise_if_email_domain_rejected(email)
     return False
 
 
@@ -2096,7 +2210,9 @@ return 'enter';
             if log_callback and time.time() - last_diag_time >= 5:
                 last_diag_time = time.time()
                 log_callback(f"[Debug] 已点击注册但页面未前进，重试提交: {email}")
+            raise_if_email_domain_rejected(email)
         sleep_with_cancel(0.5, cancel_callback)
+    raise_if_email_domain_rejected(email)
     if last_snapshot:
         inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
         buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
@@ -2250,8 +2366,7 @@ return 'clicked';
 
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    global page
-    if page is None:
+    if _active_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
     try:
@@ -2602,7 +2717,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
         raise_if_cancelled(cancel_callback)
         try:
             refresh_active_page()
-            if page is None:
+            if _active_page() is None:
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
@@ -2791,9 +2906,15 @@ class GrokRegisterGUI:
                 pady=3,
             )
 
+        # 公共配置
         add_label(0, 0, "邮箱服务商:")
-        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_var = tk.StringVar(value=config.get("email_provider", "cloudflare"))
+        self.email_provider_combo = tk_option_menu(
+            config_frame,
+            self.email_provider_var,
+            ["duckmail", "yyds", "cloudflare", "mailnest", "cloudmail"],
+            width=12,
+        )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -2824,29 +2945,64 @@ class GrokRegisterGUI:
         self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
         add_field(self.proxy_entry, 1, 3)
 
-        add_label(2, 0, "DuckMail API Key:")
-        self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
-        self.api_key_entry = tk_entry(config_frame, textvariable=self.api_key_var, width=34)
-        add_field(self.api_key_entry, 2, 1)
-
-        add_label(2, 2, "Cloudflare 鉴权模式:")
-        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "none"))
-        self.cloudflare_auth_mode_combo = tk_option_menu(
-            config_frame, self.cloudflare_auth_mode_var, ["query-key", "bearer", "x-api-key", "x-admin-auth", "none"], width=12
+        # 服务商专属配置（按选择显示）
+        self.provider_frame = tk.LabelFrame(
+            config_frame,
+            text="邮箱服务商配置",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
         )
-        add_field(self.cloudflare_auth_mode_combo, 2, 3, sticky=tk.W)
+        self.provider_frame.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
+        self.provider_frame.grid_columnconfigure(1, weight=1, minsize=240)
+        self.provider_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
-        add_label(3, 0, "Cloudflare API Base:")
+        def p_label(row, column, text):
+            w = tk_label(self.provider_frame, text=text, bg=UI_PANEL_BG)
+            w.grid(row=row, column=column, sticky=tk.W, padx=(0, 6), pady=3)
+            return w
+
+        def p_field(widget, row, column, columnspan=1, sticky=tk.EW):
+            widget.grid(
+                row=row,
+                column=column,
+                columnspan=columnspan,
+                sticky=sticky,
+                padx=(0, 14),
+                pady=3,
+            )
+            return widget
+
+        # DuckMail / Mail.tm
+        self.api_key_var = tk.StringVar(value=config.get("duckmail_api_key", ""))
+        self.duckmail_api_base_var = tk.StringVar(
+            value=str(config.get("duckmail_api_base", "") or DUCKMAIL_API_BASE_DEFAULT)
+        )
+        self._duckmail_widgets = [
+            p_label(0, 0, "API Base:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.duckmail_api_base_var, width=52), 0, 1, columnspan=3),
+            p_label(1, 0, "API Key (可选):"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.api_key_var, width=34), 1, 1),
+            p_label(1, 2, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="Mail.tm 填 https://api.mail.tm；DuckMail 默认 api.duckmail.sbs",
+                    bg=UI_PANEL_BG,
+                ),
+                1,
+                3,
+                sticky=tk.W,
+            ),
+        ]
+
+        # Cloudflare
+        self.cloudflare_auth_mode_var = tk.StringVar(value=config.get("cloudflare_auth_mode", "none"))
         self.cloudflare_api_base_var = tk.StringVar(value=config.get("cloudflare_api_base", ""))
-        self.cloudflare_api_base_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_base_var, width=72)
-        add_field(self.cloudflare_api_base_entry, 3, 1, columnspan=3)
-
-        add_label(4, 0, "Cloudflare API Key:")
         self.cloudflare_api_key_var = tk.StringVar(value=config.get("cloudflare_api_key", ""))
-        self.cloudflare_api_key_entry = tk_entry(config_frame, textvariable=self.cloudflare_api_key_var, width=34)
-        add_field(self.cloudflare_api_key_entry, 4, 1)
-
-        add_label(4, 2, "CF 路径:")
         self.cloudflare_paths_var = tk.StringVar(
             value=",".join(
                 [
@@ -2857,66 +3013,229 @@ class GrokRegisterGUI:
                 ]
             )
         )
-        self.cloudflare_paths_entry = tk_entry(config_frame, textvariable=self.cloudflare_paths_var, width=34)
-        add_field(self.cloudflare_paths_entry, 4, 3)
+        self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
+        self.cloudflare_custom_auth_var = tk.StringVar(value=str(config.get("cloudflare_custom_auth", "")))
+        self._cloudflare_widgets = [
+            p_label(0, 0, "API Base:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_api_base_var, width=52), 0, 1, columnspan=3),
+            p_label(1, 0, "鉴权模式:"),
+            p_field(
+                tk_option_menu(
+                    self.provider_frame,
+                    self.cloudflare_auth_mode_var,
+                    ["query-key", "bearer", "x-api-key", "x-admin-auth", "none"],
+                    width=12,
+                ),
+                1,
+                1,
+                sticky=tk.W,
+            ),
+            p_label(1, 2, "API Key:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_api_key_var, width=34), 1, 3),
+            p_label(2, 0, "收信域名:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 2, 1),
+            p_label(2, 2, "全局密码:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_custom_auth_var, width=34), 2, 3),
+            p_label(3, 0, "CF 路径:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_paths_var, width=52), 3, 1, columnspan=3),
+        ]
 
-        add_label(5, 0, "CPA 直出(SSO→auth):")
+        # YYDS
+        self.yyds_api_key_var = tk.StringVar(value=str(config.get("yyds_api_key", "")))
+        self.yyds_jwt_var = tk.StringVar(value=str(config.get("yyds_jwt", "")))
+        self.yyds_default_domain_var = tk.StringVar(value=str(config.get("yyds_default_domain", "")))
+        self._yyds_widgets = [
+            p_label(0, 0, "API Key:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.yyds_api_key_var, width=34), 0, 1),
+            p_label(0, 2, "JWT:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.yyds_jwt_var, width=34), 0, 3),
+            p_label(1, 0, "固定收信域名:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.yyds_default_domain_var, width=34), 1, 1),
+            p_label(1, 2, "说明:"),
+            p_field(
+                tk_label(self.provider_frame, text="域名留空则自动选已验证域", bg=UI_PANEL_BG),
+                1,
+                3,
+                sticky=tk.W,
+            ),
+        ]
+
+        # MailNest
+        self.mailnest_api_key_var = tk.StringVar(value=str(config.get("mailnest_api_key", "")))
+        self.mailnest_project_code_var = tk.StringVar(
+            value=str(config.get("mailnest_project_code", MAILNEST_DEFAULT_PROJECT_CODE) or MAILNEST_DEFAULT_PROJECT_CODE)
+        )
+        self._mailnest_widgets = [
+            p_label(0, 0, "API Key:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.mailnest_api_key_var, width=34), 0, 1),
+            p_label(0, 2, "项目代码:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.mailnest_project_code_var, width=34), 0, 3),
+        ]
+
+        # CloudMail
+        self.cloudmail_url_var = tk.StringVar(value=str(config.get("cloudmail_url", "")))
+        self.cloudmail_admin_email_var = tk.StringVar(value=str(config.get("cloudmail_admin_email", "")))
+        self.cloudmail_password_var = tk.StringVar(value=str(config.get("cloudmail_password", "")))
+        # CloudMail 也用 defaultDomains；与 CF 共用变量即可
+        self._cloudmail_widgets = [
+            p_label(0, 0, "站点 URL:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudmail_url_var, width=52), 0, 1, columnspan=3),
+            p_label(1, 0, "管理员邮箱:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.cloudmail_admin_email_var, width=34), 1, 1),
+            p_label(1, 2, "管理员密码:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.cloudmail_password_var, width=34, show="*"),
+                1,
+                3,
+            ),
+            p_label(2, 0, "收信域名:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 2, 1),
+            p_label(2, 2, "说明:"),
+            p_field(
+                tk_label(self.provider_frame, text="多个域名用逗号分隔", bg=UI_PANEL_BG),
+                2,
+                3,
+                sticky=tk.W,
+            ),
+        ]
+
+        self._provider_widget_groups = {
+            "duckmail": self._duckmail_widgets,
+            "cloudflare": self._cloudflare_widgets,
+            "yyds": self._yyds_widgets,
+            "mailnest": self._mailnest_widgets,
+            "cloudmail": self._cloudmail_widgets,
+        }
+
+        add_label(3, 0, "并发数:")
+        self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
+        self.workers_spinbox = tk.Spinbox(
+            config_frame,
+            from_=1,
+            to=8,
+            width=8,
+            textvariable=self.workers_var,
+            bg=UI_ENTRY_BG,
+            fg=UI_FG,
+            insertbackground=UI_FG,
+            buttonbackground=UI_BUTTON_BG,
+            disabledbackground="#2f2f2f",
+            disabledforeground=UI_MUTED_FG,
+            relief=tk.SOLID,
+        )
+        add_field(self.workers_spinbox, 3, 1, sticky=tk.W)
+
+        # SSO → CPA auth 可选
+        self.cpa_frame = tk.LabelFrame(
+            config_frame,
+            text="SSO → CPA auth（可选）",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
+        )
+        self.cpa_frame.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.cpa_frame.grid_columnconfigure(1, weight=1, minsize=240)
+        self.cpa_frame.grid_columnconfigure(3, weight=1, minsize=240)
+
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
-        self.cpa_auto_add_check = tk_checkbutton(config_frame, variable=self.cpa_auto_add_var)
-        add_field(self.cpa_auto_add_check, 5, 1, sticky=tk.W)
+        tk_checkbutton(
+            self.cpa_frame,
+            text="注册成功后将 SSO 转为 CPA auth 并入库",
+            variable=self.cpa_auto_add_var,
+        ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=3)
 
-        add_label(6, 0, "CPA auth 目录:")
+        self._cpa_detail_widgets = []
+        def c_label(row, col, text):
+            w = tk_label(self.cpa_frame, text=text, bg=UI_PANEL_BG)
+            w.grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=3)
+            self._cpa_detail_widgets.append(w)
+            return w
+
+        def c_field(widget, row, col, columnspan=1, sticky=tk.EW):
+            widget.grid(row=row, column=col, columnspan=columnspan, sticky=sticky, padx=(0, 14), pady=3)
+            self._cpa_detail_widgets.append(widget)
+            return widget
+
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "")))
-        self.cpa_auth_dir_entry = tk_entry(config_frame, textvariable=self.cpa_auth_dir_var, width=72)
-        add_field(self.cpa_auth_dir_entry, 6, 1, columnspan=3)
-
-        add_label(7, 0, "CPA 远程地址:")
         self.cpa_remote_url_var = tk.StringVar(value=str(config.get("cpa_remote_url", "")))
-        self.cpa_remote_url_entry = tk_entry(config_frame, textvariable=self.cpa_remote_url_var, width=40)
-        add_field(self.cpa_remote_url_entry, 7, 1)
-
-        add_label(7, 2, "CPA 管理密钥:")
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
-        self.cpa_management_key_entry = tk_entry(config_frame, textvariable=self.cpa_management_key_var, width=28)
-        add_field(self.cpa_management_key_entry, 7, 3)
+        c_label(1, 0, "auth 目录:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_auth_dir_var, width=52), 1, 1, columnspan=3)
+        c_label(2, 0, "远程地址:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_remote_url_var, width=34), 2, 1)
+        c_label(2, 2, "管理密钥:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 2, 3)
 
-        add_label(8, 0, "Sub2API 直出:")
-        self.sub2api_auto_add_var = tk.BooleanVar(value=bool(config.get("sub2api_auto_add", False)))
-        self.sub2api_auto_add_check = tk_checkbutton(config_frame, variable=self.sub2api_auto_add_var)
-        add_field(self.sub2api_auto_add_check, 8, 1, sticky=tk.W)
+        # SSO → Sub2API 可选（导入包 / 远程创建）
+        self.sub2api_frame = tk.LabelFrame(
+            config_frame,
+            text="SSO → Sub2API（可选）",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
+        )
+        self.sub2api_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.sub2api_frame.grid_columnconfigure(1, weight=1, minsize=240)
+        self.sub2api_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
-        add_label(9, 0, "Sub2API 目录:")
+        self.sub2api_auto_add_var = tk.BooleanVar(
+            value=bool(config.get("sub2api_auto_add", False))
+        )
+        tk_checkbutton(
+            self.sub2api_frame,
+            text="注册成功后将 SSO 转为 Sub2API 账号（导入包 / 远程创建）",
+            variable=self.sub2api_auto_add_var,
+        ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=3)
+
+        self._sub2api_detail_widgets = []
+
+        def s_label(row, col, text):
+            w = tk_label(self.sub2api_frame, text=text, bg=UI_PANEL_BG)
+            w.grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=3)
+            self._sub2api_detail_widgets.append(w)
+            return w
+
+        def s_field(widget, row, col, columnspan=1, sticky=tk.EW):
+            widget.grid(row=row, column=col, columnspan=columnspan, sticky=sticky, padx=(0, 14), pady=3)
+            self._sub2api_detail_widgets.append(widget)
+            return widget
+
         self.sub2api_dir_var = tk.StringVar(value=str(config.get("sub2api_dir", "")))
-        self.sub2api_dir_entry = tk_entry(config_frame, textvariable=self.sub2api_dir_var, width=72)
-        add_field(self.sub2api_dir_entry, 9, 1, columnspan=3)
-
-        add_label(10, 0, "Sub2API 地址:")
         self.sub2api_url_var = tk.StringVar(value=str(config.get("sub2api_url", "")))
-        self.sub2api_url_entry = tk_entry(config_frame, textvariable=self.sub2api_url_var, width=40)
-        add_field(self.sub2api_url_entry, 10, 1)
-
-        add_label(10, 2, "Sub2API Token:")
         self.sub2api_token_var = tk.StringVar(value=str(config.get("sub2api_token", "")))
-        self.sub2api_token_entry = tk_entry(config_frame, textvariable=self.sub2api_token_var, width=28)
-        add_field(self.sub2api_token_entry, 10, 3)
-
-        add_label(11, 0, "Sub2API 每包数量:")
         self.sub2api_batch_size_var = tk.StringVar(
             value=str(config.get("sub2api_batch_size", 20))
         )
-        self.sub2api_batch_size_entry = tk_entry(
-            config_frame, textvariable=self.sub2api_batch_size_var, width=12
-        )
-        add_field(self.sub2api_batch_size_entry, 11, 1, sticky=tk.W)
-
-        add_label(11, 2, "并行验活:")
         self.sub2api_verify_var = tk.BooleanVar(
             value=bool(config.get("sub2api_verify", True))
         )
-        self.sub2api_verify_check = tk_checkbutton(
-            config_frame, variable=self.sub2api_verify_var
+        s_label(1, 0, "导入包目录:")
+        s_field(tk_entry(self.sub2api_frame, textvariable=self.sub2api_dir_var, width=52), 1, 1, columnspan=3)
+        s_label(2, 0, "远程地址:")
+        s_field(tk_entry(self.sub2api_frame, textvariable=self.sub2api_url_var, width=34), 2, 1)
+        s_label(2, 2, "管理 Token:")
+        s_field(tk_entry(self.sub2api_frame, textvariable=self.sub2api_token_var, width=28), 2, 3)
+        s_label(3, 0, "每包数量:")
+        s_field(tk_entry(self.sub2api_frame, textvariable=self.sub2api_batch_size_var, width=12), 3, 1, sticky=tk.W)
+        self._sub2api_verify_check = tk_checkbutton(
+            self.sub2api_frame,
+            text="并行验活",
+            variable=self.sub2api_verify_var,
         )
-        add_field(self.sub2api_verify_check, 11, 3, sticky=tk.W)
+        s_field(self._sub2api_verify_check, 3, 2, columnspan=2, sticky=tk.W)
+
+        self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
+        self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
+        self.sub2api_auto_add_var.trace_add("write", lambda *_: self._refresh_sub2api_fields())
+        self._refresh_provider_fields()
+        self._refresh_cpa_fields()
+        self._refresh_sub2api_fields()
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -2966,6 +3285,42 @@ class GrokRegisterGUI:
         self.log("[*] GUI 已就绪，配置已加载")
         self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
 
+    def _refresh_provider_fields(self):
+        """按当前邮箱服务商只显示相关配置项。"""
+        provider = (self.email_provider_var.get() or "cloudflare").strip().lower()
+        titles = {
+            "duckmail": "DuckMail / Mail.tm 配置",
+            "cloudflare": "Cloudflare 配置",
+            "yyds": "YYDS 配置",
+            "mailnest": "MailNest 配置",
+            "cloudmail": "CloudMail 配置",
+        }
+        self.provider_frame.configure(text=titles.get(provider, "邮箱服务商配置"))
+        for widgets in self._provider_widget_groups.values():
+            for widget in widgets:
+                widget.grid_remove()
+        for widget in self._provider_widget_groups.get(provider, self._cloudflare_widgets):
+            # grid_remove 后无参 grid() 会恢复原行列
+            widget.grid()
+
+    def _refresh_cpa_fields(self):
+        """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
+        enabled = bool(self.cpa_auto_add_var.get())
+        for widget in getattr(self, "_cpa_detail_widgets", []):
+            if enabled:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
+    def _refresh_sub2api_fields(self):
+        """未开启 SSO→Sub2API 时隐藏 Sub2API 目录/远程配置。"""
+        enabled = bool(self.sub2api_auto_add_var.get())
+        for widget in getattr(self, "_sub2api_detail_widgets", []):
+            if enabled:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
@@ -2977,7 +3332,37 @@ class GrokRegisterGUI:
         self.log_text.delete(1.0, tk.END)
 
     def update_stats(self):
-        self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
+        fail_detail = format_fail_stats(getattr(self, "fail_stats", {}) or {})
+        if self.fail_count:
+            self.stats_var.set(
+                f"成功: {self.success_count} | 失败: {self.fail_count}（{fail_detail}）"
+            )
+        else:
+            self.stats_var.set(f"成功: {self.success_count} | 失败: 0")
+
+    def _record_failure(self, exc):
+        kind = classify_failure(exc)
+        lock = getattr(self, "_stats_lock", None)
+        if lock:
+            with lock:
+                self.fail_count += 1
+                if not hasattr(self, "fail_stats") or self.fail_stats is None:
+                    self.fail_stats = empty_fail_stats()
+                self.fail_stats[kind] = self.fail_stats.get(kind, 0) + 1
+        else:
+            self.fail_count += 1
+            if not hasattr(self, "fail_stats") or self.fail_stats is None:
+                self.fail_stats = empty_fail_stats()
+            self.fail_stats[kind] = self.fail_stats.get(kind, 0) + 1
+        return kind
+
+    def _record_success(self):
+        lock = getattr(self, "_stats_lock", None)
+        if lock:
+            with lock:
+                self.success_count += 1
+        else:
+            self.success_count += 1
 
     def _set_running_ui(self, running):
         self.is_running = running
@@ -2994,13 +3379,26 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
 
-        config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
+        config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
+        config["duckmail_api_base"] = self.duckmail_api_base_var.get().strip() or DUCKMAIL_API_BASE_DEFAULT
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
+        config["defaultDomains"] = self.default_domains_var.get().strip()
+        config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
+        config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
+        config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
+        config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()
+        config["mailnest_project_code"] = (
+            self.mailnest_project_code_var.get().strip() or MAILNEST_DEFAULT_PROJECT_CODE
+        )
+        config["yyds_default_domain"] = self.yyds_default_domain_var.get().strip()
+        config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
+        config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
+        config["cloudmail_password"] = self.cloudmail_password_var.get()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
@@ -3010,12 +3408,9 @@ class GrokRegisterGUI:
         config["sub2api_url"] = self.sub2api_url_var.get().strip()
         config["sub2api_token"] = self.sub2api_token_var.get().strip()
         try:
-            config["sub2api_batch_size"] = max(
-                int(self.sub2api_batch_size_var.get().strip()), 1
-            )
-        except Exception:
-            self.log("[!] Sub2API 每包数量无效")
-            return
+            config["sub2api_batch_size"] = max(int(self.sub2api_batch_size_var.get()), 1)
+        except (TypeError, ValueError):
+            config["sub2api_batch_size"] = 20
         config["sub2api_verify"] = bool(self.sub2api_verify_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
@@ -3027,16 +3422,42 @@ class GrokRegisterGUI:
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
             return
+        if config["email_provider"] == "mailnest" and not config["mailnest_api_key"]:
+            self.log("[!] MailNest 模式需要先填写 MailNest API Key")
+            return
+        if config["email_provider"] == "cloudmail":
+            missing = []
+            if not get_cloudmail_url():
+                missing.append("CloudMail URL")
+            if not get_cloudmail_admin_email():
+                missing.append("CloudMail 管理员邮箱")
+            if not get_cloudmail_password():
+                missing.append("CloudMail 管理员密码")
+            if not config["defaultDomains"]:
+                missing.append("默认收信域名")
+            if missing:
+                self.log(f"[!] CloudMail 模式缺少配置: {', '.join(missing)}")
+                return
+        if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url"):
+            self.log("[!] 已开启 SSO→auth，但未配置 auth 目录或远程地址")
+            return
         try:
             count = int(self.count_var.get())
         except Exception:
             self.log("[!] 注册数量无效")
             return
+        try:
+            workers = int(self.workers_var.get())
+        except Exception:
+            workers = 1
+        workers = max(1, min(workers, 8, count))
         config["register_count"] = count
+        config["register_workers"] = workers
         save_config()
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
+        self.fail_stats = empty_fail_stats()
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.accounts_output_file = os.path.join(
@@ -3044,12 +3465,17 @@ class GrokRegisterGUI:
         )
         self.update_stats()
         self._set_running_ui(True)
-        self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
+        self._stats_lock = threading.Lock()
+        self._accounts_lock = threading.Lock()
+        self.log(f"[*] 配置已保存，开始执行。目标数量: {count} | 并发: {workers}")
+        if int(self.workers_var.get() or 1) > count:
+            self.log(f"[*] 并发已自动调整为 {workers}（不超过注册数量）")
+        self.log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
+        self.log(f"[*] SSO→Sub2API: {'开' if config.get('sub2api_auto_add') else '关'}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
-        begin_sub2api_batch_session(log_callback=self.log)
         threading.Thread(
-            target=self.run_registration,
-            args=(count,),
+            target=self._run_registration_entry,
+            args=(count, workers),
             daemon=True,
         ).start()
 
@@ -3057,17 +3483,66 @@ class GrokRegisterGUI:
         self.stop_requested = True
         self.log("[!] 用户停止注册")
 
-    def run_registration(self, count):
+    def _run_registration_entry(self, count, workers):
+        # 并发数不超过任务数，避免空 worker 白开浏览器
+        workers = max(1, min(int(workers or 1), 8, int(count or 1)))
+        # 启动 Sub2API 批次会话（共享写入器 + 并行验活线程池），供各 worker 复用
+        begin_sub2api_batch_session(log_callback=self.log)
         try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
+            if workers <= 1:
+                self.run_registration(count, worker_id=0, workers=1)
+            else:
+                base, rem = divmod(count, workers)
+                chunks = [base + (1 if i < rem else 0) for i in range(workers)]
+                # 去掉 0 任务分片，重新编号
+                chunks = [n for n in chunks if n > 0]
+                self.log(f"[*] 实际并发 worker={len(chunks)}，分片={chunks}")
+                threads = []
+                for wid, n in enumerate(chunks):
+                    t = threading.Thread(
+                        target=self.run_registration,
+                        args=(n, wid, len(chunks)),
+                        daemon=True,
+                    )
+                    t.start()
+                    threads.append(t)
+                    # 错开启动，降低同时拉起 Chrome 的冲突
+                    time.sleep(0.8)
+                for t in threads:
+                    t.join()
+        finally:
+            # 等待 Sub2API 并行验活/导出任务收尾（关闭共享线程池）
+            try:
+                wait_sub2api_pending(log_callback=self.log)
+            except BaseException:
+                pass
+            # 协调线程自身无浏览器；各 worker 线程 finally 已各自 stop
+            self._set_running_ui(False)
+            self.log(
+                f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
+                + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
+            )
+
+    def run_registration(self, count, worker_id=0, workers=1):
+        prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
+
+        def wlog(message):
+            text = str(message)
+            if prefix and not text.startswith(prefix):
+                self.log(prefix + text)
+            else:
+                self.log(text)
+
+        try:
+            start_browser(log_callback=wlog)
+            wlog("[*] 浏览器已启动")
             i = 0
             retry_count_for_slot = 0
             max_slot_retry = 3
             while i < count:
                 if self.should_stop():
                     break
-                self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
                 try:
                     email = ""
                     dev_token = ""
@@ -3075,16 +3550,16 @@ class GrokRegisterGUI:
                     mail_ok = False
                     max_mail_retry = 3
                     for mail_try in range(1, max_mail_retry + 1):
-                        self.log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+                        wlog(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
                         open_signup_page(
-                            log_callback=self.log, cancel_callback=self.should_stop
+                            log_callback=wlog, cancel_callback=self.should_stop
                         )
-                        self.log("[*] 2. 创建邮箱并提交")
+                        wlog("[*] 2. 创建邮箱并提交")
                         email, dev_token = fill_email_and_submit(
-                            log_callback=self.log, cancel_callback=self.should_stop
+                            log_callback=wlog, cancel_callback=self.should_stop
                         )
-                        self.log(f"[*] 邮箱: {email}")
-                        self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+                        wlog(f"[*] 邮箱: {email}")
+                        wlog(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
                             with open(
                                 os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
@@ -3094,12 +3569,12 @@ class GrokRegisterGUI:
                                 f.write(f"{email}\t{dev_token}\n")
                         except Exception:
                             pass
-                        self.log("[*] 3. 拉取验证码")
+                        wlog("[*] 3. 拉取验证码")
                         try:
                             code = fill_code_and_submit(
                                 email,
                                 dev_token,
-                                log_callback=self.log,
+                                log_callback=wlog,
                                 cancel_callback=self.should_stop,
                             )
                             mail_ok = True
@@ -3107,109 +3582,130 @@ class GrokRegisterGUI:
                         except Exception as mail_exc:
                             msg = str(mail_exc)
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                self.log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=self.log)
+                                wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                                restart_browser(log_callback=wlog)
                                 sleep_with_cancel(1, self.should_stop)
                                 continue
                             raise
 
                     if not mail_ok:
                         raise Exception("验证码阶段失败，已达到最大重试次数")
-                    self.log(f"[*] 验证码: {code}")
-                    self.log("[*] 4. 填写资料")
+                    wlog(f"[*] 验证码: {code}")
+                    wlog("[*] 4. 填写资料")
                     profile = fill_profile_and_submit(
-                        log_callback=self.log, cancel_callback=self.should_stop
+                        log_callback=wlog, cancel_callback=self.should_stop
                     )
-                    self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    self.log("[*] 5. 等待 sso cookie")
+                    wlog(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                    wlog("[*] 5. 等待 sso cookie")
                     sso = wait_for_sso_cookie(
-                        log_callback=self.log, cancel_callback=self.should_stop
+                        log_callback=wlog, cancel_callback=self.should_stop
                     )
                     if config.get("enable_nsfw", True):
-                        self.log("[*] 6. 开启 NSFW")
-                        cf_clearance, browser_ua = extract_cf_clearance_and_ua(self.log)
+                        wlog("[*] 6. 开启 NSFW")
+                        cf_clearance, browser_ua = extract_cf_clearance_and_ua(wlog)
                         nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=self.log
+                            sso, cf_clearance=cf_clearance, user_agent=browser_ua, log_callback=wlog
                         )
                         if nsfw_ok:
-                            self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
+                            wlog(f"[+] NSFW 开启成功: {nsfw_msg}")
                         else:
-                            self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                    self.results.append({"email": email, "sso": sso, "profile": profile})
+                            wlog(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
+                    lock = getattr(self, "_stats_lock", None)
+                    export_ok = wait_sub2api_account_result(
+                        add_sso_to_sub2api(sso, email=email, log_callback=wlog)
+                    )
+                    if not export_ok:
+                        raise Exception("换 token 或验活失败，不计入成功")
+                    add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    if lock:
+                        with lock:
+                            self.results.append({"email": email, "sso": sso, "profile": profile})
+                    else:
+                        self.results.append({"email": email, "sso": sso, "profile": profile})
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
+                        alock = getattr(self, "_accounts_lock", None)
+                        if alock:
+                            with alock:
+                                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                                    f.write(line)
+                        else:
+                            with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                                f.write(line)
                     except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_sso_to_cpa(sso, email=email, log_callback=self.log)
-                    add_sso_to_sub2api(sso, email=email, log_callback=self.log)
-                    self.success_count += 1
+                        wlog(f"[Debug] 保存账号文件失败: {file_exc}")
+                    self._record_success()
                     retry_count_for_slot = 0
                     i += 1
-                    self.log(f"[+] 注册成功: {email}")
+                    wlog(f"[+] 验活成功并计入: {email}")
                     if (
                         self.success_count > 0
                         and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
                         and i < count
+                        and workers <= 1
                     ):
                         cleanup_runtime_memory(
-                            log_callback=self.log,
+                            log_callback=wlog,
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
                 except RegistrationCancelled:
-                    self.log("[!] 注册被用户停止")
+                    wlog("[!] 注册被用户停止")
                     break
+                except EmailDomainRejected as exc:
+                    kind = self._record_failure(exc)
+                    retry_count_for_slot = 0
+                    i += 1
+                    wlog(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                    wlog("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
                 except AccountRetryNeeded as exc:
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
-                        self.log(
+                        wlog(
                             f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
                         )
                     else:
-                        self.fail_count += 1
-                        self.log(
-                            f"[-] 当前账号已达到最大重试次数，跳过: {exc}"
+                        kind = self._record_failure(exc)
+                        wlog(
+                            f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}"
                         )
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
-                    self.fail_count += 1
+                    kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
-                    self.log(f"[-] 注册失败: {exc}")
+                    wlog(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 finally:
                     self.update_stats()
                     if self.should_stop():
                         break
+                    # 每轮结束只关浏览器，不立刻再开。
+                    # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
+                    if i >= count:
+                        continue
                     try:
-                        if browser is None:
-                            start_browser(log_callback=self.log)
-                        else:
-                            restart_browser(log_callback=self.log)
-                        # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                        time.sleep(1)
-                    except RegistrationCancelled:
-                        break
-                    except Exception as restart_exc:
+                        stop_browser()
+                        time.sleep(0.5)
+                    except Exception as close_exc:
                         if self.should_stop():
                             break
-                        self.log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                        wlog(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
         except RegistrationCancelled:
-            self.log("[!] 注册被用户停止")
+            wlog("[!] 注册被用户停止")
         except Exception as exc:
-            self.log(f"[!] 任务异常: {exc}")
+            wlog(f"[!] 任务异常: {exc}")
         finally:
-            try:
-                wait_sub2api_pending(log_callback=self.log)
-            except BaseException:
-                pass
             try:
                 stop_browser()
             except BaseException:
                 pass
-            self._set_running_ui(False)
-            self.log("[*] 任务结束")
+            # 多 worker 时由 _run_registration_entry 统一收尾 UI
+            if workers <= 1:
+                self._set_running_ui(False)
+                self.log(
+                    f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
+                    + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
+                )
 
 
 class CliStopController:
@@ -3248,15 +3744,160 @@ def run_registration_cli(count):
     signal.signal(signal.SIGINT, _on_sigint)
     success_count = 0
     fail_count = 0
+    fail_stats = empty_fail_stats()
     retry_count_for_slot = 0
     max_slot_retry = 3
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}")
+    workers = max(1, min(int(config.get("register_workers", 1) or 1), 8, int(count or 1)))
+    cli_log(f"[*] 终端模式启动，目标数量: {count} | 并发: {workers}")
+    cli_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
+    cli_log(f"[*] SSO→Sub2API: {'开' if config.get('sub2api_auto_add') else '关'}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     begin_sub2api_batch_session(log_callback=cli_log)
+
+    def _cli_record_failure(exc):
+        nonlocal fail_count
+        kind = classify_failure(exc)
+        fail_count += 1
+        fail_stats[kind] = fail_stats.get(kind, 0) + 1
+        return kind
+
+    if workers > 1:
+        # CLI 并发：多线程，每线程独立浏览器（thread-local）
+        stats_lock = threading.Lock()
+        accounts_lock = threading.Lock()
+        base, rem = divmod(count, workers)
+        chunks = [base + (1 if i < rem else 0) for i in range(workers)]
+        threads = []
+        shared = {"success": 0, "fail": 0, "fail_stats": empty_fail_stats()}
+
+        def worker(n, wid):
+            local_success = 0
+            local_fail = 0
+            local_fail_stats = empty_fail_stats()
+            try:
+                start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
+                i = 0
+                retry = 0
+                while i < n and not controller.should_stop():
+                    try:
+                        open_signup_page(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                        email, dev_token = fill_email_and_submit(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                        code = fill_code_and_submit(
+                            email,
+                            dev_token,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                        profile = fill_profile_and_submit(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                        sso = wait_for_sso_cookie(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                        if config.get("enable_nsfw", True):
+                            cf_clearance, browser_ua = extract_cf_clearance_and_ua(
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                            )
+                            enable_nsfw_for_token(
+                                sso,
+                                cf_clearance=cf_clearance,
+                                user_agent=browser_ua,
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            )
+                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        export_ok = wait_sub2api_account_result(
+                            add_sso_to_sub2api(
+                                sso,
+                                email=email,
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            )
+                        )
+                        if not export_ok:
+                            raise Exception("换 token 或验活失败，不计入成功")
+                        add_sso_to_cpa(sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
+                        with accounts_lock:
+                            with open(accounts_output_file, "a", encoding="utf-8") as f:
+                                f.write(line)
+                        local_success += 1
+                        i += 1
+                        retry = 0
+                        cli_log(f"[W{wid+1}] [+] 验活成功并计入: {email}")
+                    except RegistrationCancelled:
+                        break
+                    except EmailDomainRejected as exc:
+                        kind = classify_failure(exc)
+                        local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                        local_fail += 1
+                        i += 1
+                        retry = 0
+                        cli_log(f"[W{wid+1}] [-] 域名拒绝: {exc}")
+                    except AccountRetryNeeded as exc:
+                        retry += 1
+                        if retry > max_slot_retry:
+                            kind = classify_failure(exc)
+                            local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                            local_fail += 1
+                            i += 1
+                            retry = 0
+                            cli_log(f"[W{wid+1}] [-] 卡住跳过: {exc}")
+                    except Exception as exc:
+                        kind = classify_failure(exc)
+                        local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
+                        local_fail += 1
+                        i += 1
+                        retry = 0
+                        cli_log(f"[W{wid+1}] [-] 失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                    finally:
+                        if i < n and not controller.should_stop():
+                            try:
+                                stop_browser()
+                                time.sleep(0.3)
+                            except Exception:
+                                pass
+            finally:
+                try:
+                    stop_browser()
+                except Exception:
+                    pass
+                with stats_lock:
+                    shared["success"] += local_success
+                    shared["fail"] += local_fail
+                    for k, v in local_fail_stats.items():
+                        shared["fail_stats"][k] = shared["fail_stats"].get(k, 0) + v
+
+        for wid, n in enumerate(chunks):
+            if n <= 0:
+                continue
+            t = threading.Thread(target=worker, args=(n, wid), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        try:
+            wait_sub2api_pending(log_callback=cli_log)
+        except BaseException:
+            pass
+        success_count = shared["success"]
+        fail_count = shared["fail"]
+        fail_stats = shared["fail_stats"]
+        cli_log(
+            f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
+            + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
+        )
+        return
+
     try:
         start_browser(log_callback=cli_log)
         cli_log("[*] 浏览器已启动")
@@ -3334,16 +3975,23 @@ def run_registration_cli(count):
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
+                except Exception:
+                    line = f"{email}--------{sso}\n"
+                export_ok = wait_sub2api_account_result(
+                    add_sso_to_sub2api(sso, email=email, log_callback=cli_log)
+                )
+                if not export_ok:
+                    raise Exception("换 token 或验活失败，不计入成功")
+                add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                try:
                     with open(accounts_output_file, "a", encoding="utf-8") as f:
                         f.write(line)
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_sso_to_cpa(sso, email=email, log_callback=cli_log)
-                add_sso_to_sub2api(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
-                cli_log(f"[+] 注册成功: {email}")
+                cli_log(f"[+] 验活成功并计入: {email}")
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
                     cleanup_runtime_memory(
@@ -3353,6 +4001,12 @@ def run_registration_cli(count):
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
                 break
+            except EmailDomainRejected as exc:
+                kind = _cli_record_failure(exc)
+                retry_count_for_slot = 0
+                i += 1
+                cli_log(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                cli_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
@@ -3360,35 +4014,35 @@ def run_registration_cli(count):
                         f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
                     )
                 else:
-                    fail_count += 1
+                    kind = _cli_record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
-                    cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                    cli_log(f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             except Exception as exc:
-                fail_count += 1
+                kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
-                cli_log(f"[-] 注册失败: {exc}")
+                cli_log(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             finally:
                 if controller.should_stop():
                     break
+                # 每轮结束只关浏览器，不立刻再开。
+                # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
+                if i >= count:
+                    continue
                 try:
-                    if browser is None:
-                        start_browser(log_callback=cli_log)
-                    else:
-                        restart_browser(log_callback=cli_log)
-                    # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                    time.sleep(1)
+                    stop_browser()
+                    time.sleep(0.5)
                 except KeyboardInterrupt:
                     controller.stop()
                     cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
                     break
                 except RegistrationCancelled:
                     break
-                except Exception as restart_exc:
+                except Exception as close_exc:
                     if controller.should_stop():
                         break
-                    cli_log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                    cli_log(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
@@ -3398,19 +4052,22 @@ def run_registration_cli(count):
         cli_log(f"[!] 任务异常: {exc}")
     finally:
         try:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except Exception:
-            pass
-        try:
             wait_sub2api_pending(log_callback=cli_log)
         except BaseException:
+            pass
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except Exception:
             pass
         try:
             cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
         except BaseException:
             pass
         try:
-            cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+            cli_log(
+                f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
+                + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
+            )
         except BaseException:
             pass
         try:

@@ -43,9 +43,11 @@ cpa_auth/
 !requirements.txt
 *.log
 
-# 本地一次性调试脚本
+# 本地一次性调试脚本 / 上游对照快照
 _compare_cpa.py
 _compare_*.py
+_merge_*.py
+.upstream_snap/
 
 # 编辑器 / 系统
 .DS_Store

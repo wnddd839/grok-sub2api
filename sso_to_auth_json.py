@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-SSO cookie → ~/.grok/auth.json 格式（纯 HTTP Device Flow）
+SSO cookie → CPA / grok auth.json 格式（纯 HTTP Device Flow）
+
+写出 CLIProxyAPI 扁平 xai-*.json；并支持 Sub2API 导入包导出与验活。
 
 用法:
   # 单个 / 批量 SSO，写出多个独立 auth 文件（每个可直接 cp 到 ~/.grok/auth.json）
@@ -11,6 +13,9 @@ SSO cookie → ~/.grok/auth.json 格式（纯 HTTP Device Flow）
 
   # 单行 sso
   python3 sso_to_auth_json.py --sso-cookie 'eyJ...' --out ~/.grok/auth.json
+
+  # 只出 CPA
+  python3 sso_to_auth_json.py --sso sso_list.txt --cpa-auth-dir /path/to/auths --proxy http://127.0.0.1:7890
 """
 from __future__ import annotations
 
@@ -32,33 +37,45 @@ from curl_cffi import requests
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
 AUTH_KEY = f"{OIDC_ISSUER}::{CLIENT_ID}"
+# 与当前可用号 JWT scope 对齐（含 conversations:*）
 SCOPES = (
     "openid profile email offline_access grok-cli:access "
     "api:access conversations:read conversations:write"
 )
 
+# --- Device Flow / CLI headers ----------------------------------------------
+GROK_VERSION = "0.2.93"
+GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
+
 # --- CLIProxyAPI (CPA) 扁平格式常量 ------------------------------------------
-# 与上游 grokRegister-cpa 原生导出保持一致：
-# Build/CLI token（scope 含 grok-cli:access）走 cli-chat-proxy.grok.com，
-# 并附带 grok-cli headers（见 token_to_cpa_record）。
+# CPA 的 internal/auth/xai/token.go TokenStorage 读的是扁平字段。
+# Build/CLI token（scope 含 grok-cli:access）必须走 cli-chat-proxy.grok.com，
+# 不能用默认 api.x.ai/v1（那是计费通道，会 402）。
+# headers 对齐 @xai-official/grok CLI / grok-build-auth（无 x-authenticateresponse）
 CPA_TOKEN_ENDPOINT = f"{OIDC_ISSUER}/oauth2/token"
 CPA_GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_GROK_HEADERS = {
+    "User-Agent": GROK_TOKEN_UA,
     "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-grok-client-version": "0.2.93",
-    "x-grok-client-identifier": "grok-shell",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-identifier": "grok-pager",
+    "x-grok-client-version": GROK_VERSION,
 }
+CPA_PROBE_MODEL = "grok-4.5"
+CPA_PROBE_URL = f"{CPA_GROK_BASE_URL}/responses"
+
 
 # --- Sub2API (Wei-Shaw/sub2api) Grok OAuth credentials ----------------------
-# 对齐 backend/internal/service/grok_oauth_service.go BuildAccountCredentials
+# Align BuildAccountCredentials; keep CLI headers to avoid 426 version(none).
 SUB2API_CLIENT_ID = CLIENT_ID
 SUB2API_SCOPE = "openid profile email offline_access grok-cli:access api:access"
 SUB2API_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
-# 与 Sub2API v0.1.152 / CPA 原生导出保持一致，避免上游 426 version(none)
 SUB2API_VERIFY_HEADERS = {
+    "User-Agent": GROK_TOKEN_UA,
     "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-grok-client-version": "0.2.93",
-    "x-grok-client-identifier": "grok-shell",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-identifier": "grok-pager",
+    "x-grok-client-version": GROK_VERSION,
     "Accept": "application/json",
 }
 
@@ -68,10 +85,7 @@ def verify_grok_credentials(
     proxy: str = "",
     timeout: int = 25,
 ) -> tuple[bool, str]:
-    """对 cli-chat-proxy 发起一次 /models 验活。
-
-    返回 (ok, message)。2xx/3xx 视为通过；401/403/426 等视为失败。
-    """
+    """Probe cli-chat-proxy /models once. Returns (ok, message)."""
     access = str((creds or {}).get("access_token") or "").strip()
     if not access:
         return False, "missing access_token"
@@ -101,6 +115,7 @@ def verify_grok_credentials(
     if body:
         detail = f"{detail}: {body}"
     return False, detail
+
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -133,6 +148,7 @@ def _urlopen(req, proxy: str = "", timeout: int = 15):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+
 def request_device_code(proxy: str = "", log=print) -> dict | None:
     data = urllib.parse.urlencode({"client_id": CLIENT_ID, "scope": SCOPES}).encode()
     req = urllib.request.Request(
@@ -149,7 +165,14 @@ def request_device_code(proxy: str = "", log=print) -> dict | None:
         return None
 
 
-def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 60, proxy: str = "", log=print) -> dict | None:
+def poll_token(
+    device_code: str,
+    interval: int,
+    expires_in: int,
+    timeout: int = 60,
+    proxy: str = "",
+    log=print,
+) -> dict | None:
     deadline = time.time() + min(expires_in, timeout)
     while time.time() < deadline:
         time.sleep(interval)
@@ -184,7 +207,10 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
 
 
 def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in)。proxy 非空时全程走代理。"""
+    """SSO cookie → token dict (access/refresh/expires_in)。
+
+    使用 OAuth Device Flow（回退到原先可用路径）。proxy 非空时全程走代理。
+    """
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
     if proxies:
@@ -314,10 +340,10 @@ def _safe_email_for_filename(email: str) -> str:
     return safe or "unknown"
 
 
-def token_to_cpa_record(token: dict, email: str = "") -> dict:
+def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
     """token dict → CLIProxyAPI 扁平 xai auth 记录。
 
-    对齐上游 grokRegister-cpa 原生导出（cli-chat-proxy + grok-cli headers）。
+    对齐上游 grokRegister-cpa / grok-build-auth（cli-chat-proxy + grok-cli headers）。
     """
     access = token.get("access_token") or token.get("key") or ""
     refresh = token.get("refresh_token") or ""
@@ -339,7 +365,7 @@ def token_to_cpa_record(token: dict, email: str = "") -> dict:
         except Exception:
             expired = ""
 
-    return {
+    record = {
         "type": "xai",
         "auth_kind": "oauth",
         "email": email or "",
@@ -357,6 +383,9 @@ def token_to_cpa_record(token: dict, email: str = "") -> dict:
         "disabled": False,
         "headers": dict(CPA_GROK_HEADERS),
     }
+    if sso:
+        record["sso"] = sso
+    return record
 
 
 def cpa_auth_filename(record: dict) -> str:
