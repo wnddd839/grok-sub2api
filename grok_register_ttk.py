@@ -40,6 +40,39 @@ from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
 from email_providers.common import pick_list_payload as _pick_list
 
+import browser_session as _bs
+import register_flow as _rf
+import connectivity as _conn
+from browser_session import (
+    browser,
+    page,
+    active_browser as _active_browser,
+    active_page as _active_page,
+    set_browser_session as _set_browser_session,
+    start_browser,
+    stop_browser,
+    restart_browser,
+    cleanup_runtime_memory,
+    refresh_active_page,
+    extract_cf_clearance_and_ua,
+    create_browser_options,
+)
+from register_flow import (
+    SIGNUP_URL,
+    click_email_signup_button,
+    open_signup_page,
+    has_profile_form,
+    detect_email_domain_rejection,
+    raise_if_email_domain_rejected,
+    fill_email_and_submit,
+    fill_code_and_submit,
+    getTurnstileToken,
+    build_profile,
+    fill_profile_and_submit,
+    wait_for_sso_cookie,
+)
+
+
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
@@ -446,14 +479,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
         _cpa_log(f"直出失败: {exc}")
 
 
-def create_browser_options():
-    options = ChromiumOptions()
-    options.auto_port()
-    options.set_timeouts(base=1)
-    if os.path.exists(EXTENSION_PATH):
-        options.add_extension(EXTENSION_PATH)
-    return options
-
+# create_browser_options -> browser_session
 
 def _build_request_kwargs(**kwargs):
     request_kwargs = dict(kwargs)
@@ -1346,54 +1372,7 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
         return False, f"异常: {str(e)}"
 
 
-SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
-
-_tls = threading.local()
-
-
-def _active_browser():
-    return getattr(_tls, "browser", None)
-
-
-def _active_page():
-    return getattr(_tls, "page", None)
-
-
-def _set_browser_session(browser_obj=None, page_obj=None):
-    _tls.browser = browser_obj
-    _tls.page = page_obj
-
-
-# 兼容旧代码中的 browser / page 名称（读写走线程本地）
-class _SessionProxy:
-    __slots__ = ("_key",)
-
-    def __init__(self, key):
-        self._key = key
-
-    def _obj(self):
-        return getattr(_tls, self._key, None)
-
-    def __bool__(self):
-        return self._obj() is not None
-
-    def __eq__(self, other):
-        return self._obj() is other
-
-    def __ne__(self, other):
-        return self._obj() is not other
-
-    def __getattr__(self, name):
-        obj = self._obj()
-        if obj is None:
-            raise AttributeError(f"{self._key} is not started")
-        return getattr(obj, name)
-
-
-# 注意：start/stop 必须用 _set_browser_session，不要对 browser/page 直接赋值
-browser = _SessionProxy("browser")
-page = _SessionProxy("page")
-
+# browser session state -> browser_session
 
 def setup_light_theme(root):
     try:
@@ -1496,1376 +1475,23 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
-def start_browser(log_callback=None):
-    last_exc = None
-    for attempt in range(1, 5):
-        try:
-            browser_obj = Chromium(create_browser_options())
-            tabs = browser_obj.get_tabs()
-            page_obj = tabs[-1] if tabs else browser_obj.new_tab()
-            _set_browser_session(browser_obj, page_obj)
-            if log_callback and getattr(browser_obj, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser_obj.user_data_path}")
-            if log_callback and attempt > 1:
-                log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
-            return browser_obj, page_obj
-        except Exception as exc:
-            last_exc = exc
-            if log_callback:
-                log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
-            try:
-                cur = _active_browser()
-                if cur is not None:
-                    cur.quit(del_data=True)
-            except Exception:
-                pass
-            _set_browser_session(None, None)
-            time.sleep(min(1.5 * attempt, 4))
-    raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
-
-
 def is_debug_mode():
     return bool(config.get("debug_mode", False))
 
-
-def stop_browser(force=False):
-    """关闭当前线程浏览器。调试模式默认保留窗口，除非 force=True。"""
-    if is_debug_mode() and not force:
-        return
-    current = _active_browser()
-    _set_browser_session(None, None)
-    if current is None:
-        return
-    try:
-        current.quit(del_data=True)
-    except BaseException:
-        # KeyboardInterrupt 继承 BaseException，清理阶段必须吞掉，避免 Ctrl+C 刷 traceback
-        pass
-
-
-def restart_browser(log_callback=None):
-    stop_browser(force=True)
-    return start_browser(log_callback=log_callback)
-
-
-def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
-    try:
-        if is_debug_mode():
-            if log_callback:
-                log_callback(f"[*] 调试模式：保留浏览器（{reason}）")
-            collected = gc.collect()
-            if log_callback:
-                log_callback(f"[*] Python GC 已回收对象数: {collected}")
-            return
-        if log_callback:
-            log_callback(f"[*] {reason}: 关闭浏览器并清理内存")
-        stop_browser(force=True)
-        collected = gc.collect()
-        if log_callback:
-            log_callback(f"[*] Python GC 已回收对象数: {collected}")
-    except BaseException:
-        # 退出清理中再收到 Ctrl+C 时静默结束，不向外抛
-        try:
-            if not is_debug_mode():
-                stop_browser(force=True)
-        except BaseException:
-            pass
-
-
-def refresh_active_page():
-    if _active_browser() is None:
-        restart_browser()
-    try:
-        browser_obj = _active_browser()
-        tabs = browser_obj.get_tabs()
-        if tabs:
-            page_obj = tabs[-1]
-        else:
-            page_obj = browser_obj.new_tab()
-        _set_browser_session(browser_obj, page_obj)
-    except Exception:
-        restart_browser()
-    return page
-
-
-def extract_cf_clearance_and_ua(log_callback=None, ensure_grok=True):
-    """从注册浏览器提取 grok.com 的 cf_clearance 及其绑定的真实 UA。
-
-    注册多半停在 accounts.x.ai，未必有 grok.com 的 cf_clearance。
-    ensure_grok=True 时会先打开 https://grok.com/ 让浏览器过盾再取 cookie。
-    """
-    cf_clearance = ""
-    user_agent = ""
-    try:
-        active = refresh_active_page()
-        if active is None:
-            return "", ""
-
-        def _read_cf_and_ua(page_obj, grok_only=False):
-            clearance = ""
-            ua_text = ""
-            cookies = page_obj.cookies(all_domains=True, all_info=True) or []
-            for item in cookies:
-                if isinstance(item, dict):
-                    name = str(item.get("name", "")).strip()
-                    value = str(item.get("value", "")).strip()
-                    domain = str(item.get("domain", "")).strip().lower()
-                else:
-                    name = str(getattr(item, "name", "")).strip()
-                    value = str(getattr(item, "value", "")).strip()
-                    domain = str(getattr(item, "domain", "")).strip().lower()
-                if name != "cf_clearance" or not value:
-                    continue
-                # set-birth-date 在 grok.com：必须用 grok.com 域 clearance，其它域的无效
-                if grok_only and "grok.com" not in domain:
-                    continue
-                if "grok.com" in domain:
-                    clearance = value
-                    break
-                if not clearance and not grok_only:
-                    clearance = value
-            try:
-                ua = page_obj.run_js("return navigator.userAgent;")
-                if ua:
-                    ua_text = str(ua).strip()
-            except Exception:
-                pass
-            return clearance, ua_text
-
-        def _page_passed_cf(page_obj):
-            try:
-                title = str(page_obj.run_js("return document.title || '';") or "").lower()
-                body = str(
-                    page_obj.run_js(
-                        "return (document.body && (document.body.innerText||'')) || '';"
-                    )
-                    or ""
-                ).lower()
-                if "just a moment" in title or "just a moment" in body[:200]:
-                    return False
-                if "checking your browser" in body[:300]:
-                    return False
-                return True
-            except Exception:
-                return False
-
-        # 只要 grok.com 域下的 clearance；其它域的不算
-        cf_clearance, user_agent = _read_cf_and_ua(active, grok_only=True)
-        if ensure_grok and not cf_clearance:
-            if log_callback:
-                log_callback("[*] 未找到 grok.com 的 cf_clearance，打开 grok.com 过盾...")
-            try:
-                active.get("https://grok.com/")
-                try:
-                    active.wait.doc_loaded()
-                except Exception:
-                    pass
-                time.sleep(2)
-                for i in range(20):
-                    if _page_passed_cf(active):
-                        cf_clearance, user_agent = _read_cf_and_ua(active, grok_only=True)
-                        if cf_clearance:
-                            break
-                    time.sleep(1.0)
-                if log_callback:
-                    if cf_clearance:
-                        log_callback("[*] 已取得 grok.com 的 cf_clearance")
-                    else:
-                        log_callback(
-                            "[!] 打开 grok.com 后仍无有效 cf_clearance（页面可能仍卡在 Just a moment）"
-                        )
-            except Exception as nav_exc:
-                if log_callback:
-                    log_callback(f"[Debug] 打开 grok.com 取 cf_clearance 失败: {nav_exc}")
-                cf_clearance, user_agent = _read_cf_and_ua(active, grok_only=True)
-    except Exception as exc:
-        if log_callback:
-            log_callback(f"[Debug] 提取 cf_clearance 失败: {exc}")
-    return cf_clearance, user_agent
-
-
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        if log_callback:
-            log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
-
-        clicked = page.run_js(r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function nodeText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
-    const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
-    return 0;
-}
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-const target = candidates[0]?.node || null;
-if (!target) {
-    return false;
-}
-target.click();
-return candidates[0].text || true;
-        """)
-
-        if clicked:
-            if log_callback:
-                detail = f": {clicked}" if isinstance(clicked, str) else ""
-                log_callback(f"[*] 已点击「使用邮箱注册」按钮{detail}")
-            sleep_with_cancel(2, cancel_callback)
-            return True
-
-        if log_callback:
-            current_url = page.url if page else "none"
-            log_callback(f"[Debug] 当前URL: {current_url}")
-
-        sleep_with_cancel(1, cancel_callback)
-
-    if log_callback:
-        page_html = page.html[:500] if page else "no page"
-        log_callback(f"[Debug] 页面内容片段: {page_html}")
-
-    raise Exception("未找到「使用邮箱注册」按钮")
-
-
-def open_signup_page(log_callback=None, cancel_callback=None):
-    raise_if_cancelled(cancel_callback)
-    if _active_browser() is None:
-        start_browser(log_callback=log_callback)
-        if log_callback:
-            log_callback("[*] 浏览器已启动")
-
-    def _navigate_signup():
-        # 优先复用已有标签，避免反复 new_tab 堆积空窗口
-        browser_obj = _active_browser()
-        if browser_obj is None:
-            start_browser(log_callback=log_callback)
-            browser_obj = _active_browser()
-        try:
-            tabs = browser_obj.get_tabs() if browser_obj is not None else []
-            page_obj = tabs[-1] if tabs else browser_obj.new_tab()
-        except Exception:
-            page_obj = browser_obj.new_tab()
-        _set_browser_session(browser_obj, page_obj)
-        page_obj.get(SIGNUP_URL)
-        page_obj.wait.doc_loaded()
-        # 确认真的进了注册域；about:blank / 错页直接失败
-        current = str(getattr(page_obj, "url", "") or "")
-        if "accounts.x.ai" not in current and "x.ai" not in current:
-            raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
-
-    try:
-        _navigate_signup()
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[Debug] 打开URL异常: {e}")
-        try:
-            restart_browser(log_callback=log_callback)
-            _navigate_signup()
-        except Exception as e2:
-            # 导航彻底失败：关掉残留实例，避免空浏览器挂着
-            try:
-                stop_browser()
-            except Exception:
-                pass
-            raise Exception(f"打开注册页失败: {e2}") from e2
-
-    sleep_with_cancel(2, cancel_callback)
-    if log_callback:
-        log_callback(f"[*] 当前URL: {_active_page().url if _active_page() else ''}")
-    click_email_signup_button(
-        log_callback=log_callback, cancel_callback=cancel_callback
+def _wire_runtime_modules():
+    """把主模块依赖注入到 browser_session / register_flow。"""
+    _bs.configure(get_proxies=get_proxies, is_debug=is_debug_mode, extension_path=EXTENSION_PATH)
+    _rf.configure(
+        get_email_and_token=get_email_and_token,
+        get_oai_code=get_oai_code,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        RegistrationCancelled=RegistrationCancelled,
+        EmailDomainRejected=EmailDomainRejected,
+        AccountRetryNeeded=AccountRetryNeeded,
     )
 
-
-def has_profile_form(log_callback=None):
-    refresh_active_page()
-    try:
-        return bool(
-            page.run_js(
-                """
-const givenInput = document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
-const familyInput = document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
-const passwordInput = document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"]');
-return !!(givenInput && familyInput && passwordInput);
-            """
-            )
-        )
-    except Exception:
-        return False
-
-
-def detect_email_domain_rejection(email=""):
-    """检测 xAI 是否拒绝当前邮箱域名。
-
-    返回拒绝文案字符串；未检测到则返回空字符串。
-    """
-    if not page:
-        return ""
-    try:
-        result = page.run_js(
-            r"""
-function collectText() {
-    const chunks = [];
-    const selectors = [
-        '[role="alert"]',
-        '[data-testid*="error" i]',
-        '[class*="error" i]',
-        '[class*="Error"]',
-        '[class*="danger" i]',
-        '[class*="invalid" i]',
-        'p', 'span', 'div', 'li', 'label',
-    ];
-    for (const sel of selectors) {
-        for (const node of Array.from(document.querySelectorAll(sel)).slice(0, 80)) {
-            const style = window.getComputedStyle(node);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-            const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-            if (text && text.length >= 8 && text.length <= 400) chunks.push(text);
-        }
-    }
-    const body = (document.body && (document.body.innerText || document.body.textContent) || '')
-        .replace(/\s+/g, ' ').trim();
-    if (body) chunks.push(body.slice(0, 1200));
-    return Array.from(new Set(chunks));
-}
-const texts = collectText();
-const patterns = [
-    /邮箱域名[^。\n]{0,80}被拒绝/,
-    /域名[^。\n]{0,40}已被拒绝/,
-    /已被拒绝[^。\n]{0,40}邮箱/,
-    /email domain[^.\n]{0,80}rejected/i,
-    /domain[^.\n]{0,40}(has been |is )?rejected/i,
-    /please use (a )?different email/i,
-    /use another email address/i,
-    /请使用其他邮箱/,
-    /support@x\.ai/,
-];
-for (const text of texts) {
-    for (const re of patterns) {
-        if (re.test(text)) {
-            const m = text.match(/.{0,40}(拒绝|rejected|different email|其他邮箱).{0,80}/i);
-            return (m && m[0]) || text.slice(0, 180);
-        }
-    }
-}
-return '';
-            """
-        )
-        if isinstance(result, str) and result.strip():
-            return result.strip()
-    except Exception:
-        pass
-    return ""
-
-
-def raise_if_email_domain_rejected(email=""):
-    message = detect_email_domain_rejection(email)
-    if message:
-        raise EmailDomainRejected(email=email, message=message)
-
-
-def _email_page_advanced_once(email):
-    """检测邮箱提交后页面是否真正前进（离开邮箱输入阶段）。
-
-    点击注册按钮只代表触发了点击，不代表表单真的提交成功。
-    若 Cloudflare 挑战未过或页面卡住，按钮点击无实际效果，
-    邮箱输入框会一直停留，导致后续空等验证码。
-
-    判定“已前进”的依据：
-      - 出现验证码输入框（OTP / code 输入），或
-      - 原本可见可用的邮箱输入框已消失/不可用
-
-    返回:
-      - True：页面已前进，提交生效
-      - False：仍停留在邮箱输入页
-    """
-    # 域名被拒时仍停在邮箱页，优先抛出明确错误
-    raise_if_email_domain_rejected(email)
-    try:
-        return bool(
-            page.run_js(
-                """
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function textOf(node) {
-    return [
-        node.getAttribute('aria-label'),
-        node.getAttribute('placeholder'),
-        node.getAttribute('name'),
-        node.getAttribute('id'),
-        node.getAttribute('autocomplete'),
-        node.getAttribute('data-testid'),
-    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
-}
-// 1. 出现验证码输入框 => 已前进
-const codeInput = Array.from(document.querySelectorAll('input')).find((node) => {
-    if (!isVisible(node)) return false;
-    const type = (node.getAttribute('type') || '').toLowerCase();
-    if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(type)) return false;
-    const meta = textOf(node);
-    const inMode = (node.getAttribute('inputmode') || '').toLowerCase();
-    return (
-        meta.includes('code') || meta.includes('otp') || meta.includes('verif') ||
-        meta.includes('验证') || meta.includes('one-time') || inMode === 'numeric' ||
-        node.getAttribute('autocomplete') === 'one-time-code'
-    );
-});
-if (codeInput) return true;
-// 2. 邮箱输入框已消失/不可用 => 已前进
-const emailInput = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'))
-    .find((node) => isVisible(node) && !node.disabled && !node.readOnly);
-if (!emailInput) return true;
-return false;
-                """
-            )
-        )
-    except EmailDomainRejected:
-        raise
-    except Exception:
-        return False
-
-
-def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
-    """点击提交后，在有限窗口内轮询确认页面确实前进。
-
-    给页面/网络一点反应时间：若窗口内检测到已前进则返回 True，
-    否则返回 False，由调用方继续重试点击或最终超时换邮箱。
-    """
-    deadline = time.time() + wait
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        raise_if_email_domain_rejected(email)
-        if _email_page_advanced_once(email):
-            return True
-        sleep_with_cancel(0.4, cancel_callback)
-    raise_if_email_domain_rejected(email)
-    return False
-
-
-def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
-    raise_if_cancelled(cancel_callback)
-    email, dev_token = get_email_and_token()
-    if not email or not dev_token:
-        raise Exception("获取邮箱失败")
-    if log_callback:
-        log_callback(f"[*] 已创建邮箱: {email}")
-    deadline = time.time() + timeout
-    last_diag_time = 0
-    last_reclick_time = 0
-    last_snapshot = None
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
-            r"""
-const email = arguments[0];
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function textOf(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('placeholder'),
-        node.getAttribute('data-testid'),
-        node.getAttribute('name'),
-        node.getAttribute('id'),
-        node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function describeInput(node) {
-    return [
-        `type=${node.getAttribute('type') || ''}`,
-        `name=${node.getAttribute('name') || ''}`,
-        `id=${node.getAttribute('id') || ''}`,
-        `placeholder=${node.getAttribute('placeholder') || ''}`,
-        `aria=${node.getAttribute('aria-label') || ''}`,
-        `testid=${node.getAttribute('data-testid') || ''}`,
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
-}
-function describeAction(node) {
-    return textOf(node).slice(0, 120);
-}
-function emailCandidates() {
-    const direct = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'));
-    const all = Array.from(document.querySelectorAll('input, textarea'));
-    for (const node of all) {
-        const type = (node.getAttribute('type') || '').toLowerCase();
-        if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
-        const meta = textOf(node).toLowerCase();
-        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
-            direct.push(node);
-        }
-    }
-    return Array.from(new Set(direct));
-}
-const visibleInputs = Array.from(document.querySelectorAll('input, textarea'))
-    .filter((node) => isVisible(node) && !node.disabled && !node.readOnly)
-    .map(describeInput)
-    .slice(0, 8);
-const visibleActions = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map(describeAction)
-    .filter(Boolean)
-    .slice(0, 10);
-const input = emailCandidates().find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
-if (!input) {
-    return {
-        state: 'not-ready',
-        url: location.href,
-        title: document.title,
-        inputs: visibleInputs,
-        buttons: visibleActions,
-    };
-}
-input.focus(); input.click();
-const valueProto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-const valueSetter = Object.getOwnPropertyDescriptor(valueProto, 'value')?.set;
-const tracker = input._valueTracker;
-if (tracker) tracker.setValue('');
-if (valueSetter) valueSetter.call(input, email); else input.value = email;
-input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new Event('change', { bubbles: true }));
-const inputType = (input.getAttribute('type') || '').toLowerCase();
-const isValid = inputType !== 'email' || input.checkValidity();
-if ((input.value || '').trim() !== email || !isValid) {
-    return {
-        state: 'fill-failed',
-        value: input.value || '',
-        valid: isValid,
-        input: describeInput(input),
-        url: location.href,
-    };
-}
-input.blur();
-return {
-    state: 'filled',
-    input: describeInput(input),
-    url: location.href,
-};
-            """,
-            email,
-        )
-        state = filled.get("state") if isinstance(filled, dict) else filled
-        if isinstance(filled, dict):
-            last_snapshot = filled
-        if state == "not-ready":
-            now = time.time()
-            if now - last_reclick_time >= 3:
-                reclicked = page.run_js(r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function nodeText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function scoreEntry(node) {
-    const compact = nodeText(node).replace(/\s+/g, '');
-    const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
-    return 0;
-}
-const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map((node) => ({ node, score: scoreEntry(node), text: nodeText(node) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-if (!candidates.length) return false;
-candidates[0].node.click();
-return candidates[0].text || true;
-                """)
-                last_reclick_time = now
-                if reclicked and log_callback:
-                    detail = f": {reclicked}" if isinstance(reclicked, str) else ""
-                    log_callback(f"[Debug] 邮箱输入框未出现，已再次触发邮箱注册入口{detail}")
-            if log_callback and now - last_diag_time >= 5:
-                last_diag_time = now
-                inputs = " | ".join((filled or {}).get("inputs", [])[:6]) if isinstance(filled, dict) else ""
-                buttons = " | ".join((filled or {}).get("buttons", [])[:8]) if isinstance(filled, dict) else ""
-                url = (filled or {}).get("url", page.url if page else "") if isinstance(filled, dict) else (page.url if page else "")
-                log_callback(f"[Debug] 等待邮箱输入框: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}")
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-        if state != "filled":
-            if log_callback:
-                log_callback(f"[Debug] 邮箱输入框已出现，但写入失败: {filled}")
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-        sleep_with_cancel(0.8, cancel_callback)
-        clicked = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function textOf(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-        node.getAttribute('placeholder'),
-        node.getAttribute('data-testid'),
-        node.getAttribute('name'),
-        node.getAttribute('id'),
-        node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-function emailCandidates() {
-    const direct = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'));
-    const all = Array.from(document.querySelectorAll('input, textarea'));
-    for (const node of all) {
-        const type = (node.getAttribute('type') || '').toLowerCase();
-        if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
-        const meta = textOf(node).toLowerCase();
-        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
-            direct.push(node);
-        }
-    }
-    return Array.from(new Set(direct));
-}
-const input = emailCandidates().find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
-if (!input || !(input.value || '').trim()) return false;
-const inputType = (input.getAttribute('type') || '').toLowerCase();
-if (inputType === 'email' && !input.checkValidity()) return false;
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
-const submitButton = buttons.find((node) => {
-    const text = textOf(node).replace(/\s+/g, '');
-    const lower = text.toLowerCase();
-    return (
-        text === '注册' ||
-        text.includes('注册') ||
-        text.includes('继续') ||
-        text.includes('下一步') ||
-        text.includes('确认') ||
-        lower.includes('signup') ||
-        lower.includes('sign up') ||
-        lower.includes('continue') ||
-        lower.includes('next') ||
-        lower.includes('createaccount') ||
-        lower.includes('submit')
-    );
-});
-if (submitButton) {
-    submitButton.click();
-    return textOf(submitButton) || true;
-}
-const form = input.closest('form');
-if (form) {
-    if (form.requestSubmit) form.requestSubmit();
-    else form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    return 'form-submit';
-}
-input.focus();
-input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
-input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
-return 'enter';
-            """
-        )
-        if clicked:
-            # 点击按钮 != 表单真正提交成功：CF 挑战未过或页面卡住时点击无效果，
-            # 邮件不会发出。必须确认页面已离开邮箱输入阶段（邮箱框消失或出现验证码框），
-            # 否则继续循环重试点击，最终超时抛异常触发换邮箱重试。
-            if _wait_email_page_advanced(email, cancel_callback=cancel_callback):
-                if log_callback:
-                    detail = f" ({clicked})" if isinstance(clicked, str) else ""
-                    log_callback(f"[*] 已填写邮箱并提交: {email}{detail}")
-                return email, dev_token
-            if log_callback and time.time() - last_diag_time >= 5:
-                last_diag_time = time.time()
-                log_callback(f"[Debug] 已点击注册但页面未前进，重试提交: {email}")
-            raise_if_email_domain_rejected(email)
-        sleep_with_cancel(0.5, cancel_callback)
-    raise_if_email_domain_rejected(email)
-    if last_snapshot:
-        inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
-        buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
-        url = last_snapshot.get("url", page.url if page else "")
-        raise Exception(
-            f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
-        )
-    raise Exception("未找到邮箱输入框或注册按钮")
-
-
-def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cancel_callback=None):
-    def _resend_code():
-        page.run_js(
-            r"""
-const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-const target = nodes.find((node) => {
-  const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-  return t.includes('重新发送') || t.includes('resend') || t.includes('再次发送');
-});
-if (target && !target.disabled) { target.click(); return true; }
-return false;
-            """
-        )
-
-    code = get_oai_code(
-        dev_token,
-        email,
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-        resend_callback=_resend_code,
-    )
-    if not code:
-        raise Exception("获取验证码失败")
-    clean_code = str(code).replace("-", "").strip()
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
-            """
-const code = String(arguments[0] || '').trim();
-if (!code) return 'empty-code';
-
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function setInputValue(input, value) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) nativeSetter.call(input, value);
-    else input.value = value;
-    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-const aggregate = Array.from(document.querySelectorAll(
-  'input[data-input-otp=\"true\"], input[name=\"code\"], input[autocomplete=\"one-time-code\"], input[inputmode=\"numeric\"], input[inputmode=\"text\"]'
-)).find((node) => isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 6) > 1);
-
-if (aggregate) {
-    aggregate.focus();
-    aggregate.click();
-    setInputValue(aggregate, code);
-    return String(aggregate.value || '').replace(/\\s+/g, '') ? 'filled-aggregate' : 'aggregate-failed';
-}
-
-const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
-    if (!isVisible(node) || node.disabled || node.readOnly) return false;
-    const maxLength = Number(node.maxLength || 0);
-    const ac = String(node.autocomplete || '').toLowerCase();
-    return maxLength === 1 || ac === 'one-time-code';
-});
-
-if (otpBoxes.length >= code.length) {
-    for (let i = 0; i < code.length; i += 1) {
-        const ch = code[i] || '';
-        const box = otpBoxes[i];
-        box.focus();
-        box.click();
-        setInputValue(box, ch);
-        box.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch }));
-        box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch }));
-    }
-    const merged = otpBoxes.slice(0, code.length).map((x) => String(x.value || '').trim()).join('');
-    return merged.length ? 'filled-boxes' : 'boxes-failed';
-}
-
-return 'not-ready';
-            """,
-            clean_code,
-        )
-
-        if filled == "not-ready":
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-        if "failed" in str(filled):
-            if log_callback:
-                log_callback(f"[Debug] 验证码填写失败: {filled}")
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-
-        clicked = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-const buttons = Array.from(document.querySelectorAll('button[type=\"submit\"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-
-const btn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
-    return (
-        t.includes('确认邮箱') ||
-        t.includes('继续') ||
-        t.includes('下一步') ||
-        t.includes('confirm') ||
-        t.includes('continue') ||
-        t.includes('next')
-    );
-});
-
-if (!btn) return 'no-button';
-btn.focus();
-btn.click();
-return 'clicked';
-            """
-        )
-
-        if clicked == "clicked" or clicked == "no-button":
-            if log_callback:
-                log_callback(f"[*] 已填写验证码并提交: {code}")
-            sleep_with_cancel(1.5, cancel_callback)
-            return code
-
-        sleep_with_cancel(0.5, cancel_callback)
-
-    raise Exception("验证码已获取，但自动填写/提交失败")
-
-
-def getTurnstileToken(log_callback=None, cancel_callback=None):
-    if _active_page() is None:
-        raise Exception("页面未就绪，无法执行 Turnstile")
-
-    try:
-        page.run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
-
-    for _ in range(0, 20):
-        raise_if_cancelled(cancel_callback)
-        try:
-            token = page.run_js(
-                """
-try {
-  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
-  if (byInput) return byInput;
-  if (window.turnstile && typeof turnstile.getResponse === 'function') {
-    return String(turnstile.getResponse() || '').trim();
-  }
-  return '';
-} catch(e) { return ''; }
-                """
-            )
-            token = str(token or "").strip()
-            if len(token) >= 80:
-                if log_callback:
-                    log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
-                return token
-
-            challenge_input = page.ele("@name=cf-turnstile-response")
-            if challenge_input:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
-                    except Exception:
-                        pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
-        except Exception:
-            pass
-        sleep_with_cancel(1, cancel_callback)
-
-    raise Exception("Turnstile 获取 token 失败")
-
-
-def build_profile():
-    given_name_pool = [
-        "Neo", "Ethan", "Liam", "Noah", "Lucas", "Mason", "Ryan", "Leo",
-        "Owen", "Aiden", "Elio", "Aron", "Ivan", "Nolan", "Evan", "Kai",
-        "Caleb", "Adam", "Ezra", "Miles", "Logan", "Carter", "Hunter", "Jason",
-        "Brian", "Dylan", "Alex", "Colin", "Blake", "Gavin", "Henry", "Julian",
-        "Kevin", "Louis", "Marcus", "Nathan", "Oscar", "Peter", "Quinn", "Robin",
-        "Simon", "Tristan", "Victor", "Wesley", "Xavier", "Yuri", "Zane", "Felix",
-        "Aaron", "Damian",
-    ]
-    family_name_pool = [
-        "Lin", "Wang", "Zhao", "Liu", "Chen", "Zhang", "Xu", "Sun",
-        "Guo", "He", "Yang", "Wu", "Zhou", "Tang", "Qin", "Shi",
-        "Fang", "Peng", "Cao", "Deng", "Fan", "Fu", "Gao", "Han",
-        "Hu", "Jiang", "Kong", "Lu", "Ma", "Nie", "Pan", "Qiao",
-        "Ren", "Shao", "Tian", "Xie", "Yan", "Yao", "Yu", "Zeng",
-        "Bai", "Duan", "Hou", "Jin", "Kang", "Luo", "Mao", "Song",
-        "Wei", "Xiong",
-    ]
-    given_name = random.choice(given_name_pool)
-    family_name = random.choice(family_name_pool)
-    password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
-    return given_name, family_name, password
-
-
-def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
-    given_name, family_name, password = build_profile()
-    deadline = time.time() + timeout
-    form_filled_once = False
-    wait_cf_since = None
-    last_cf_retry_at = 0.0
-
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        if not form_filled_once:
-            filled = page.run_js(
-                """
-const givenName = arguments[0];
-const familyName = arguments[1];
-const password = arguments[2];
-
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-function pickInput(selector) {
-    return Array.from(document.querySelectorAll(selector)).find((node) => {
-        return isVisible(node) && !node.disabled && !node.readOnly;
-    }) || null;
-}
-
-function setInputValue(input, value) {
-    if (!input) return false;
-    input.focus();
-    input.click();
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) nativeSetter.call(input, value);
-    else input.value = value;
-    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.blur();
-    return String(input.value || '').trim() === String(value || '').trim();
-}
-
-const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[aria-label*="名"]');
-const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[aria-label*="姓"]');
-const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"], input[autocomplete="new-password"]');
-
-if (!givenInput || !familyInput || !passwordInput) return 'not-ready';
-
-const ok1 = setInputValue(givenInput, givenName);
-const ok2 = setInputValue(familyInput, familyName);
-const ok3 = setInputValue(passwordInput, password);
-
-if (!ok1 || !ok2 || !ok3) return 'fill-failed';
-
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
-
-// 必须等待 Cloudflare 校验通过后再提交
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
-}
-
-if (submitBtn) {
-    return 'ready-to-submit';
-}
-return 'filled-no-submit';
-            """,
-                given_name,
-                family_name,
-                password,
-            )
-
-            if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
-                form_filled_once = True
-                if log_callback:
-                    token_len = filled.split(":", 1)[1] if ":" in filled else "0"
-                    log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
-                if token_len == "0":
-                    pause_seconds = random.uniform(1, 3)
-                    if log_callback:
-                        log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
-                    sleep_with_cancel(pause_seconds, cancel_callback)
-                now = time.time()
-                if wait_cf_since is None:
-                    wait_cf_since = now
-                # 卡住后自动二次复用 Turnstile 组件
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                    if log_callback:
-                        log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
-                    try:
-                        token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                        if token:
-                            synced = page.run_js(
-                                """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                """,
-                                token,
-                            )
-                            if log_callback:
-                                log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                    except Exception as cf_exc:
-                        if log_callback:
-                            log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                    last_cf_retry_at = now
-                sleep_with_cancel(0.8, cancel_callback)
-                continue
-
-            if filled in ("ready-to-submit", "filled-no-submit"):
-                form_filled_once = True
-            elif filled == "fill-failed" and log_callback:
-                log_callback("[Debug] 资料输入失败，重试中...")
-                sleep_with_cancel(0.5, cancel_callback)
-                continue
-            elif filled == "not-ready":
-                sleep_with_cancel(0.5, cancel_callback)
-                continue
-
-        submit_state = page.run_js(
-            r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solvedByToken = token.length >= 80;
-    if (!solvedByToken) return 'wait-cloudflare:' + token.length;
-}
-
-function buttonText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('value'),
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
-if (!submitBtn) {
-    const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
-    return 'no-submit-button:' + visibleTexts;
-}
-submitBtn.focus();
-submitBtn.click();
-return 'submitted';
-            """
-        )
-
-        if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
-            if log_callback:
-                token_len = submit_state.split(":", 1)[1] if ":" in submit_state else "0"
-                log_callback(f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}")
-            now = time.time()
-            if wait_cf_since is None:
-                wait_cf_since = now
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                if log_callback:
-                    log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
-                try:
-                    token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                    if token:
-                        synced = page.run_js(
-                            """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                            """,
-                            token,
-                        )
-                        if log_callback:
-                            log_callback(f"[*] Turnstile 二次复用完成，回填长度={synced}")
-                except Exception as cf_exc:
-                    if log_callback:
-                        log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
-                last_cf_retry_at = now
-            sleep_with_cancel(0.8, cancel_callback)
-            continue
-
-        if submit_state == "submitted":
-            if log_callback:
-                log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
-            return {"given_name": given_name, "family_name": family_name, "password": password}
-        wait_cf_since = None
-        if isinstance(submit_state, str) and submit_state.startswith("no-submit-button") and log_callback:
-            visible_buttons = submit_state.split(":", 1)[1] if ":" in submit_state else ""
-            suffix = f" 可见按钮: {visible_buttons}" if visible_buttons else ""
-            log_callback(f"[Debug] 未找到提交按钮，继续等待页面稳定...{suffix}")
-
-        sleep_with_cancel(0.5, cancel_callback)
-
-    raise Exception("最终注册页资料填写失败")
-
-
-def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
-    deadline = time.time() + timeout
-    last_seen_names = set()
-    last_submit_retry = 0.0
-    last_cf_retry_at = 0.0
-    final_no_submit_state = ""
-    final_no_submit_since = None
-    final_no_submit_timeout = 25
-
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        try:
-            refresh_active_page()
-            if _active_page() is None:
-                sleep_with_cancel(1, cancel_callback)
-                continue
-
-            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
-            now = time.time()
-            if now - last_submit_retry >= 2.5:
-                retried = page.run_js(
-                    r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
-    const t = (el.textContent || '').replace(/\s+/g, '');
-    const lower = t.toLowerCase();
-    return t.includes('完成注册') || lower.includes('completeyoursignup') || lower.includes('completesignup');
-});
-if (!titleHit) return 'not-final-page';
-
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
-    const token = String((cfInput && cfInput.value) || '').trim();
-    const solved = token.length >= 80;
-    if (!solved) return 'final-page-wait-cf:' + token.length;
-}
-
-function buttonText(node) {
-    return [
-        node.innerText,
-        node.textContent,
-        node.getAttribute('value'),
-        node.getAttribute('aria-label'),
-        node.getAttribute('title'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = buttonText(node).replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
-});
-if (!submitBtn) {
-    const visibleTexts = buttons.map(buttonText).filter(Boolean).slice(0, 8).join(' | ');
-    return 'final-page-no-submit:' + visibleTexts;
-}
-submitBtn.focus();
-submitBtn.click();
-return 'final-page-clicked-submit';
-                    """
-                )
-                last_submit_retry = now
-                if log_callback and (retried == "final-page-clicked-submit" or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))):
-                    log_callback(f"[Debug] 最终页状态: {retried}")
-                if isinstance(retried, str) and retried.startswith("final-page-no-submit"):
-                    if retried != final_no_submit_state:
-                        final_no_submit_state = retried
-                        final_no_submit_since = now
-                    elif final_no_submit_since and now - final_no_submit_since >= final_no_submit_timeout:
-                        raise AccountRetryNeeded(
-                            f"最终注册页状态 {final_no_submit_timeout}s 未变化且未找到提交按钮，重试当前账号: {retried}"
-                        )
-                else:
-                    final_no_submit_state = ""
-                    final_no_submit_since = None
-                if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
-                    token_len = retried.split(":", 1)[1] if ":" in retried else "0"
-                    log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
-                    if now - last_cf_retry_at >= 10:
-                        if log_callback:
-                            log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
-                        try:
-                            token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
-                            if token:
-                                synced = page.run_js(
-                                    """
-const token = String(arguments[0] || '').trim();
-const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
-const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-if (nativeSetter) nativeSetter.call(cfInput, token);
-else cfInput.value = token;
-cfInput.dispatchEvent(new Event('input', { bubbles: true }));
-cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
-                                    """,
-                                    token,
-                                )
-                                if log_callback:
-                                    log_callback(f"[*] 最终页 Turnstile 二次复用完成，回填长度={synced}")
-                        except Exception as cf_exc:
-                            if log_callback:
-                                log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
-                        last_cf_retry_at = now
-
-            cookies = page.cookies(all_domains=True, all_info=True) or []
-            for item in cookies:
-                if isinstance(item, dict):
-                    name = str(item.get("name", "")).strip()
-                    value = str(item.get("value", "")).strip()
-                else:
-                    name = str(getattr(item, "name", "")).strip()
-                    value = str(getattr(item, "value", "")).strip()
-
-                if name:
-                    last_seen_names.add(name)
-
-                if name == "sso" and value:
-                    if log_callback:
-                        log_callback("[*] 已获取到 sso cookie")
-                    return value
-        except PageDisconnectedError:
-            refresh_active_page()
-        except AccountRetryNeeded:
-            raise
-        except RegistrationCancelled:
-            raise
-        except Exception:
-            pass
-
-        sleep_with_cancel(1, cancel_callback)
-
-    raise Exception(
-        f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
-    )
-
+# register page flow -> register_flow
 
 class GrokRegisterGUI:
     def __init__(self, root):
@@ -2885,6 +1511,7 @@ class GrokRegisterGUI:
 
     def setup_ui(self):
         load_config()
+        _wire_runtime_modules()
         main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         main_frame.grid_columnconfigure(0, weight=1)
@@ -3204,6 +1831,8 @@ class GrokRegisterGUI:
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = tk_button(btn_frame, text="停止", command=self.stop_registration, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.check_btn = tk_button(btn_frame, text="连通性检查", command=self.run_connectivity_check)
+        self.check_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
 
@@ -3213,6 +1842,13 @@ class GrokRegisterGUI:
         tk_label(status_frame, text="状态: ").pack(side=tk.LEFT)
         self.status_label = tk.Label(status_frame, textvariable=self.status_var, bg=UI_BG, fg="green")
         self.status_label.pack(side=tk.LEFT)
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_bar = ttk.Progressbar(
+            status_frame, variable=self.progress_var, maximum=100, length=180, mode="determinate"
+        )
+        self.progress_bar.pack(side=tk.LEFT, padx=(16, 8))
+        self.eta_var = tk.StringVar(value="进度 0/0 | ETA --")
+        tk.Label(status_frame, textvariable=self.eta_var, bg=UI_BG, fg=UI_MUTED_FG).pack(side=tk.LEFT)
         self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0")
         tk.Label(status_frame, textvariable=self.stats_var, bg=UI_BG, fg=UI_FG).pack(side=tk.RIGHT)
         log_frame = tk.LabelFrame(
@@ -3291,6 +1927,75 @@ class GrokRegisterGUI:
             )
         else:
             self.stats_var.set(f"成功: {self.success_count} | 失败: 0")
+        self._update_progress()
+
+    def _update_progress(self):
+        total = max(int(getattr(self, "batch_count", 0) or 0), 1)
+        done = int(self.success_count) + int(self.fail_count)
+        pct = min(100.0, 100.0 * done / total)
+        if hasattr(self, "progress_var"):
+            self.progress_var.set(pct)
+        # ETA
+        started = getattr(self, "_batch_started_at", None)
+        eta_text = "ETA --"
+        if started and done > 0:
+            elapsed = max(time.time() - started, 0.1)
+            rate = done / elapsed
+            remain = max(total - done, 0)
+            if rate > 0:
+                sec = int(remain / rate)
+                if sec < 60:
+                    eta_text = f"ETA {sec}s"
+                else:
+                    eta_text = f"ETA {sec // 60}m{sec % 60:02d}s"
+        if hasattr(self, "eta_var"):
+            self.eta_var.set(f"进度 {done}/{total} | {eta_text}")
+
+    def run_connectivity_check(self):
+        """一键测：代理 / 邮箱 API / CPA。"""
+        # 先把当前 GUI 关键字段写回内存配置（不强制保存文件）
+        try:
+            config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
+            config["proxy"] = self.proxy_var.get().strip()
+            config["duckmail_api_key"] = self.api_key_var.get().strip()
+            config["duckmail_api_base"] = self.duckmail_api_base_var.get().strip()
+            config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
+            config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
+            config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
+            config["defaultDomains"] = self.default_domains_var.get().strip()
+            config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
+            config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
+            config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
+            config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()
+            config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
+            config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
+            config["cloudmail_password"] = self.cloudmail_password_var.get()
+            config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
+            config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
+            config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
+            config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        except Exception:
+            pass
+        self.log("[*] 开始连通性检查...")
+        self.check_btn.config(state=tk.DISABLED)
+
+        def _job():
+            try:
+                results = _conn.run_connectivity_checks(config, http_get, http_post)
+                text = _conn.format_check_results(results)
+                all_ok = all(ok for _, ok, _ in results)
+                self.root.after(0, lambda: self._on_check_done(text, all_ok))
+            except Exception as exc:
+                self.root.after(0, lambda: self._on_check_done(f"检查异常: {exc}", False))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_check_done(self, text, all_ok):
+        self.check_btn.config(state=tk.NORMAL)
+        for line in str(text).splitlines():
+            self.log(f"[检查] {line}")
+        self.status_var.set("检查通过" if all_ok else "检查有失败项")
+        self.status_label.config(foreground="green" if all_ok else "orange")
 
     def _record_failure(self, exc):
         kind = classify_failure(exc)
@@ -3414,10 +2119,23 @@ class GrokRegisterGUI:
         self.accounts_output_file = os.path.join(
             os.path.dirname(__file__), f"accounts_{now}.txt"
         )
+        self.batch_count = count
+        self._batch_started_at = time.time()
+        self.progress_var.set(0)
+        self.eta_var.set(f"进度 0/{count} | ETA --")
         self.update_stats()
         self._set_running_ui(True)
         self._stats_lock = threading.Lock()
         self._accounts_lock = threading.Lock()
+        # 启动前快速连通性检查（失败仍可继续，只警告）
+        try:
+            checks = _conn.run_connectivity_checks(config, http_get, http_post)
+            for name, ok, detail in checks:
+                self.log(f"[检查] [{'OK' if ok else 'FAIL'}] {name}: {detail}")
+            if not all(ok for _, ok, _ in checks):
+                self.log("[!] 连通性检查存在失败项，仍继续注册（可先点「连通性检查」排查）")
+        except Exception as exc:
+            self.log(f"[!] 连通性检查异常: {exc}")
         self.log(
             f"[*] 配置已保存，开始执行。目标数量: {count} | 并发: {workers}"
             + (" | 调试模式" if config.get("debug_mode") else "")
@@ -3457,8 +2175,8 @@ class GrokRegisterGUI:
                     )
                     t.start()
                     threads.append(t)
-                    # 错开启动，降低同时拉起 Chrome 的冲突
-                    time.sleep(0.8)
+                    # 错开启动，降低同时拉起 Chrome 端口/用户目录冲突
+                    time.sleep(2.0)
                 for t in threads:
                     t.join()
         finally:
@@ -3505,7 +2223,7 @@ class GrokRegisterGUI:
                             log_callback=wlog, cancel_callback=self.should_stop
                         )
                         wlog(f"[*] 邮箱: {email}")
-                        wlog(f"[Debug] 邮箱credential(jwt): {dev_token}")
+                        wlog(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ""))})")
                         try:
                             with open(
                                 os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
@@ -3842,7 +2560,7 @@ def run_registration_cli(count):
                         log_callback=cli_log, cancel_callback=controller.should_stop
                     )
                     cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+                    cli_log(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ""))})")
                     try:
                         with open(
                             os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
@@ -3986,6 +2704,7 @@ def run_registration_cli(count):
 
 def main_cli():
     load_config()
+    _wire_runtime_modules()
     count = int(config.get("register_count", 1) or 1)
     if config.get("debug_mode"):
         count = 1
@@ -4010,6 +2729,8 @@ def main_cli():
 
 
 def main():
+    load_config()
+    _wire_runtime_modules()
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
         main_cli()
         return
