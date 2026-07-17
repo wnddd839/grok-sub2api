@@ -5,6 +5,19 @@ import grok_register_ttk as app
 
 
 class NsfwFlowTests(unittest.TestCase):
+    def test_pre_cancel_skips_nsfw_network(self):
+        with patch.object(
+            app.requests,
+            "Session",
+            side_effect=AssertionError("cancelled NSFW must not start a session"),
+        ):
+            ok, message = app.enable_nsfw_for_token(
+                "sso-token",
+                cancel_callback=lambda: True,
+            )
+        self.assertFalse(ok)
+        self.assertEqual(message, "用户已停止")
+
     def _session_context(self):
         session = MagicMock()
         session.headers = {}
@@ -44,7 +57,11 @@ class NsfwFlowTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn("浏览器内", message)
-        browser_fallback.assert_called_once_with(token="sso-token", log_callback=None)
+        browser_fallback.assert_called_once_with(
+            token="sso-token",
+            log_callback=None,
+            cancel_callback=None,
+        )
         clearance_scan.assert_not_called()
 
 

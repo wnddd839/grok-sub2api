@@ -14,7 +14,6 @@
   "cloudflare_path_messages": "/api/mails",
   "proxy": "",
   "enable_nsfw": true,
-  "debug_mode": false,
   "close_browser_on_stop": false,
   "log_level": "info",
   "register_count": 1,

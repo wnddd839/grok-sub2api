@@ -26,6 +26,44 @@ class RuntimeRegressionTests(unittest.TestCase):
         with patch.dict(os.environ, empty_proxy_env, clear=False):
             self.assertEqual(app._resolve_cpa_proxy(), "")
 
+    def test_gui_stop_first_click_sets_state_and_disables_button(self):
+        gui = object.__new__(app.GrokRegisterGUI)
+        gui.is_running = True
+        gui.sso_convert_running = False
+        gui.stop_requested = False
+        gui.stop_btn = MagicMock()
+        gui.status_var = MagicMock()
+        gui.status_label = MagicMock()
+        gui.close_browser_on_stop_var = MagicMock()
+        gui.close_browser_on_stop_var.get.return_value = True
+        logs = []
+        gui.log = logs.append
+
+        gui.stop_registration()
+        gui.stop_registration()
+
+        self.assertTrue(gui.stop_requested)
+        gui.stop_btn.config.assert_called_once_with(state=app.tk.DISABLED)
+        gui.status_var.set.assert_called_once_with("正在停止...")
+        self.assertEqual(len(logs), 1)
+
+    def test_cancelled_cpa_conversion_does_not_start_or_append_pending(self):
+        app.config["cpa_auto_add"] = True
+        app.config["cpa_auth_dir"] = "auths"
+        with patch.object(
+            app._s2cpa,
+            "sso_to_token",
+            side_effect=AssertionError("cancelled CPA must not exchange tokens"),
+        ), patch.object(app, "_append_sso_pending") as append_pending:
+            self.assertFalse(
+                app.add_sso_to_cpa(
+                    "sso-token",
+                    email="user@example.com",
+                    should_stop=lambda: True,
+                )
+            )
+        append_pending.assert_not_called()
+
     def test_parallel_browser_start_failure_counts_all_tasks(self):
         app.config["register_workers"] = 2
         logs = []

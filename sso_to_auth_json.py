@@ -28,10 +28,12 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -174,7 +176,13 @@ def _extract_next_action_ids(html: str) -> list[str]:
     return found
 
 
-def _discover_action_ids_from_js(session, html: str, base_url: str = "https://accounts.x.ai", log=None) -> list[str]:
+def _discover_action_ids_from_js(
+    session,
+    html: str,
+    base_url: str = "https://accounts.x.ai",
+    log=None,
+    should_stop=None,
+) -> list[str]:
     """从 consent 页引用的 /_next/static/chunks/*.js 解析 createServerReference 的 action id。
 
     HTML 内嵌的 40 位 hex 经常是错误候选（会 404）；真实 allow consent 在 JS 里。
@@ -209,6 +217,8 @@ def _discover_action_ids_from_js(session, html: str, base_url: str = "https://ac
     fetched = 0
     max_fetch = 40
     for score, src in scored:
+        if should_stop and should_stop():
+            break
         if fetched >= max_fetch:
             break
         full = src if src.startswith("http") else urllib.parse.urljoin(base_url.rstrip("/") + "/", src.lstrip("/"))
@@ -237,7 +247,12 @@ def _discover_action_ids_from_js(session, html: str, base_url: str = "https://ac
     return ordered
 
 
-def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
+def sso_to_token(
+    sso_cookie: str,
+    proxy: str = "",
+    log=print,
+    should_stop=None,
+) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in)。
 
     使用授权码流程（Authorization Code + PKCE）：
@@ -245,6 +260,19 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     consent 优先复用已成功的 Next-Action，失效时才扫描页面 JS 并重试。
     """
     global _working_next_action_id
+
+    stop_logged = False
+
+    def _cancelled() -> bool:
+        nonlocal stop_logged
+        stopped = bool(should_stop and should_stop())
+        if stopped and not stop_logged:
+            log("  [!] 用户停止授权转换")
+            stop_logged = True
+        return stopped
+
+    if _cancelled():
+        return None
 
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
@@ -259,6 +287,8 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
     except Exception as e:
         log(f"  ❌ 网络错误: {e}")
+        return None
+    if _cancelled():
         return None
     if "sign-in" in r.url or "sign-up" in r.url:
         log("  ❌ sso 无效")
@@ -284,6 +314,8 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     authorize_url = f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}"
 
     def _open_consent(discover_actions=False):
+        if _cancelled():
+            return None, "", []
         try:
             resp = s.get(
                 authorize_url,
@@ -307,7 +339,13 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         if "auth.x.ai" in url and "accounts.x.ai" not in url:
             base = "https://auth.x.ai"
         if discover_actions:
-            action_ids = _discover_action_ids_from_js(s, html, base_url=base, log=log)
+            action_ids = _discover_action_ids_from_js(
+                s,
+                html,
+                base_url=base,
+                log=log,
+                should_stop=should_stop,
+            )
         else:
             action_ids = []
             cached = str(_working_next_action_id or "").strip().lower()
@@ -349,6 +387,8 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
     tried: set[str] = set()
     # 最多 2 轮：第一轮优先试上次成功/内置 id；失败再重开 consent 扫 JS chunks。
     for round_i in range(2):
+        if _cancelled():
+            return None
         if round_i > 0:
             log("  [*] consent 失败，重新进入 authorize/consent 并解析 Next-Action...")
             r, final_url, action_ids = _open_consent(discover_actions=True)
@@ -358,6 +398,8 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
                 action_ids = [NEXT_ACTION_ID]
 
         for action_id in action_ids[:8]:
+            if _cancelled():
+                return None
             if action_id in tried:
                 continue
             tried.add(action_id)
@@ -405,6 +447,9 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         return None
     log("  ✅ 授权确认")
 
+    if _cancelled():
+        return None
+
     # 3) 用 authorization code 换 token
     token_data = urllib.parse.urlencode({
         "grant_type": "authorization_code",
@@ -428,6 +473,8 @@ def sso_to_token(sso_cookie: str, proxy: str = "", log=print) -> dict | None:
         )
     except Exception as e:
         log(f"  ❌ token 异常: {e}")
+        return None
+    if _cancelled():
         return None
     if r.status_code < 200 or r.status_code >= 300:
         log(f"  ❌ token HTTP {r.status_code}: {str(r.text)[:200]}")
@@ -871,102 +918,170 @@ def convert_sso_entries(
     proxy: str = "",
     delay: int = 0,
     fallback_email: str = "",
+    workers: int = 1,
     log=print,
     should_stop=None,
 ) -> dict:
-    local_target_configured = bool(out or out_dir or cpa_auth_dir)
     local_emails = collect_existing_auth_emails(
         out=out,
         out_dir=out_dir,
         cpa_auth_dir=cpa_auth_dir,
     )
     if cpa_remote_url:
-        remote_emails = collect_remote_auth_emails(
+        # 补转以远程 CPA 为准：本地 TXT 提供候选，远程缺失才转换。
+        # 本地已有 JSON 但远程缺失时仍需重转/上传，不能被本地文件跳过。
+        existing_emails = collect_remote_auth_emails(
             cpa_remote_url,
             str(cpa_management_key or ""),
         )
-        existing_emails = (
-            local_emails.intersection(remote_emails)
-            if local_target_configured
-            else remote_emails
-        )
     else:
         existing_emails = local_emails
-    log(f"🚀 SSO → auth.json: {len(entries)} 个, delay={delay}s")
-    if existing_emails:
-        log(f"[*] 已检索到本地有效账号: {len(existing_emails)} 个，重复账号将跳过")
 
-    ok = 0
-    fail = 0
-    skipped = 0
-    stopped = False
+    workers = max(1, min(int(workers or 1), 8))
     total = len(entries)
-    for i, (source_email, sso) in enumerate(entries, 1):
+    # 合并写同一 out 文件时强制单线程，避免 JSON 交错
+    if workers > 1 and out and (merge or total > 1) and not out_dir and not cpa_auth_dir and not cpa_remote_url:
+        workers = 1
+
+    log(f"🚀 SSO → auth.json: {total} 个, delay={delay}s, workers={workers}")
+    if existing_emails:
+        log(f"[*] 已检索到已有账号: {len(existing_emails)} 个，重复账号将跳过")
+
+    lock = threading.Lock()
+    stats = {"ok": 0, "fail": 0, "skipped": 0, "stopped": False}
+
+    def _log(message: str, worker_id: int | None = None) -> None:
+        prefix = f"[W{worker_id}] " if worker_id is not None and workers > 1 else ""
+        with lock:
+            log(f"{prefix}{message}")
+
+    def _process_one(i: int, source_email: str, sso: str, worker_id: int | None = None) -> None:
         if should_stop and should_stop():
-            stopped = True
-            log("[!] 用户停止补转，剩余 SSO 未处理")
-            break
-        log(f"[{i}/{total}] 开始检查")
+            with lock:
+                stats["stopped"] = True
+            return
+
         email = (source_email or fallback_email or "").strip()
         email_key = email.casefold()
-        if email_key and email_key in existing_emails:
-            skipped += 1
-            log(f"⏭️ [{i}] 跳过已存在账号: {email}")
-            continue
+        with lock:
+            if email_key and email_key in existing_emails:
+                stats["skipped"] += 1
+                already = True
+            else:
+                already = False
+        if already:
+            _log(f"⏭️ [{i}/{total}] 跳过已存在账号: {email}", worker_id)
+            return
+
+        _log(f"[{i}/{total}] 开始检查", worker_id)
         try:
-            token = sso_to_token(sso, proxy=proxy, log=log)
+            def worker_log(msg):
+                _log(str(msg), worker_id)
+
+            token = sso_to_token(
+                sso,
+                proxy=proxy,
+                log=worker_log,
+                should_stop=should_stop,
+            )
             if not token:
-                fail += 1
-                log(f"❌ [{i}] 失败")
-                continue
+                with lock:
+                    stats["fail"] += 1
+                _log(f"❌ [{i}/{total}] 失败", worker_id)
+                return
             key, entry = token_to_auth_entry(token, email=email)
             uid = entry.get("user_id") or secrets.token_hex(4)
 
             if out_dir:
                 path = Path(out_dir) / f"{uid}.json"
-                write_auth_json(path, key, entry)
-                log(f"💾 {path}")
+                with lock:
+                    write_auth_json(path, key, entry)
+                _log(f"💾 {path}", worker_id)
             if out:
-                if merge or total > 1:
-                    merge_auth_json(Path(out), key, entry, unique=True)
-                    log(f"💾 merge → {out}")
-                else:
-                    write_auth_json(Path(out), key, entry)
-                    log(f"💾 {out}")
+                with lock:
+                    if merge or total > 1:
+                        merge_auth_json(Path(out), key, entry, unique=True)
+                        out_msg = f"💾 merge → {out}"
+                    else:
+                        write_auth_json(Path(out), key, entry)
+                        out_msg = f"💾 {out}"
+                _log(out_msg, worker_id)
 
             if cpa_auth_dir or cpa_remote_url:
                 record = token_to_cpa_record(token, email=email, sso=sso)
                 if cpa_auth_dir:
-                    path = write_cpa_auth(Path(cpa_auth_dir), record)
-                    log(f"💾 CPA 本地 → {path}")
+                    with lock:
+                        path = write_cpa_auth(Path(cpa_auth_dir), record)
+                    _log(f"💾 CPA 本地 → {path}", worker_id)
                 if cpa_remote_url:
                     name = upload_cpa_auth_remote(
                         cpa_remote_url,
                         str(cpa_management_key or ""),
                         record,
                     )
-                    log(f"💾 CPA 远程 → {cpa_remote_url.rstrip('/')}/.../{name}")
+                    _log(
+                        f"💾 CPA 远程 → {cpa_remote_url.rstrip('/')}/.../{name}",
+                        worker_id,
+                    )
 
-            ok += 1
-            if email_key:
-                existing_emails.add(email_key)
-            log(f"✅ [{i}] 完成 user_id={uid[:12]}...")
+            with lock:
+                stats["ok"] += 1
+                if email_key:
+                    existing_emails.add(email_key)
+            _log(f"✅ [{i}/{total}] 完成 user_id={uid[:12]}...", worker_id)
         except Exception as exc:
-            fail += 1
-            log(f"❌ [{i}] 异常: {exc}")
+            with lock:
+                stats["fail"] += 1
+            _log(f"❌ [{i}/{total}] 异常: {exc}", worker_id)
 
-        if delay > 0 and i < total:
+        if delay > 0:
             time.sleep(delay)
+
+    if workers <= 1:
+        for i, (source_email, sso) in enumerate(entries, 1):
+            if should_stop and should_stop():
+                stats["stopped"] = True
+                log("[!] 用户停止补转，剩余 SSO 未处理")
+                break
+            _process_one(i, source_email, sso, worker_id=None)
+    else:
+        # 均匀分片：worker k 处理 entries[k::workers]
+        shards: list[list[tuple[int, str, str]]] = [[] for _ in range(workers)]
+        for i, (source_email, sso) in enumerate(entries, 1):
+            shards[(i - 1) % workers].append((i, source_email, sso))
+        log(f"[*] 分片: {workers} 线程, 每片约 {total // workers}~{(total + workers - 1) // workers} 个")
+
+        def _run_shard(worker_id: int, items: list[tuple[int, str, str]]) -> None:
+            for i, source_email, sso in items:
+                if should_stop and should_stop():
+                    with lock:
+                        stats["stopped"] = True
+                    _log("[!] 用户停止补转，剩余 SSO 未处理", worker_id)
+                    return
+                _process_one(i, source_email, sso, worker_id=worker_id)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_run_shard, wid + 1, shard)
+                for wid, shard in enumerate(shards)
+                if shard
+            ]
+            for fut in as_completed(futures):
+                fut.result()
 
     result = {
         "total": total,
-        "ok": ok,
-        "skipped": skipped,
-        "fail": fail,
-        "stopped": stopped,
+        "ok": stats["ok"],
+        "skipped": stats["skipped"],
+        "fail": stats["fail"],
+        "stopped": stats["stopped"],
+        "workers": workers,
     }
-    status = "已停止" if stopped else "完成"
-    log(f"📊 {status}: {ok}/{total} 成功, {skipped} 跳过, {fail} 失败")
+    status = "已停止" if stats["stopped"] else "完成"
+    log(
+        f"📊 {status}: {stats['ok']}/{total} 成功, "
+        f"{stats['skipped']} 跳过, {stats['fail']} 失败, workers={workers}"
+    )
     return result
 
 
@@ -1017,6 +1132,12 @@ def main() -> int:
         help="远程 CPA 管理密钥（remote-management.secret-key 明文）",
     )
     ap.add_argument("--proxy", default="", help="授权码流程走代理，如 http://127.0.0.1:7890")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="并发线程数（分片处理 SSO），默认 1，最大 8",
+    )
     args = ap.parse_args()
 
     auto_scan = not args.sso and not args.sso_cookie
@@ -1080,6 +1201,7 @@ def main() -> int:
         proxy=args.proxy,
         delay=args.delay,
         fallback_email=args.email,
+        workers=args.workers,
     )
     return 0 if result["fail"] == 0 else 1
 

@@ -67,20 +67,14 @@ cp config.example.json config.json
 | --- | --- |
 | `cpa_auto_add` | 是否注册后 SSO→CPA auth（关则只保存 SSO） |
 | `register_workers` | 并发浏览器数，默认 1，最大 8 |
-| `debug_mode` | 调试模式：强制单账号、结束后不关闭浏览器 |
 | `log_level` | `info`（默认，隐藏 `[Debug]`）/ `debug`（全量日志） |
 
-### 并发 / 调试 / 连通性
+### 并发 / 连通性
 
 **并发 `register_workers`**
 - 每个 worker 独立 Chrome 用户目录，降低资料目录冲突
 - 实际并发不超过注册数量；worker 启动错开约 2 秒
 - 浏览器连续启动失败时日志会提示降低并发
-
-**调试模式 `debug_mode`**
-- 强制数量=1、并发=1
-- 任务结束后**不关闭**浏览器，方便你检查页面
-- 中途换邮箱仍会 `restart_browser`（强制重启）
 
 **连通性检查**
 - GUI「连通性检查」或开始注册前自动跑
@@ -240,7 +234,7 @@ SSO 不是 CPA 凭据。程序会：
 
 #### GUI 补转
 
-注册任务停止时，点击主界面的 **补转缺失 SSO**。程序会在仓库目录扫描全部 `accounts_*.txt` 和 `sso_pending.txt`，按邮箱去重，然后使用 GUI 当前的代理与 CPA 配置，只转换尚无有效本地 auth JSON 的账号。转换在后台线程运行，不会卡住界面；点击“停止”会在当前账号完成后停止补转。
+注册任务停止时，点击主界面的 **补转缺失 SSO**。程序会在仓库目录扫描全部 `accounts_*.txt` 和 `sso_pending.txt`，按邮箱去重，再与远程 CPA 的已有邮箱比较，只转换远程缺失的账号。转换在后台线程运行，不会卡住界面；点击“停止”会在当前账号完成后停止补转。
 
 #### Python 自动扫描
 
@@ -278,7 +272,7 @@ python sso_to_auth_json.py --sso-cookie 'eyJ...' \
 
 `sso_list.txt`：一行一个 SSO、`邮箱----sso`，或 `邮箱----密码----sso`。
 
-批量转换会先按邮箱扫描本地有效 auth JSON；配置了远程 CPA 时，也会通过 Management API 检索远程已有账号。已存在的账号会跳过，缺失、损坏或上次转换失败（没有有效 JSON）的账号才会继续转换。要重试账号，保留 TXT 行并删除对应损坏的 JSON 即可。
+配置了远程 CPA 时，批量转换以远程 Management API 返回的邮箱为唯一判重来源：本地 TXT 有、远程 CPA 没有的账号才会转换。没有配置远程 CPA 时，才回退到本地有效 auth JSON 判重。TXT 内重复邮箱也会先去重。
 
 ### 为什么必须用授权码流程
 

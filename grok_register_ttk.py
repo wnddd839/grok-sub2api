@@ -145,7 +145,6 @@ DEFAULT_CONFIG = {
     "cloudflare_path_messages": "/api/mails",
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
-    "debug_mode": False,
     "close_browser_on_stop": False,
     "log_level": "info",
     "register_count": 1,
@@ -475,7 +474,7 @@ def _append_sso_pending(email: str, sso: str, log_callback=None):
             log_callback(f"[CPA] 写入 sso_pending 失败: {exc}")
 
 
-def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
+def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
     """SSO → 授权码流程换 token → 写入本地 CPA auth 目录和/或远程 CPA。
 
     返回 True 表示 CPA 入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
@@ -507,11 +506,25 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             log_callback(f"[CPA] {str(message).strip()}")
 
     try:
+        if should_stop and should_stop():
+            _cpa_log("用户停止，跳过授权转换")
+            return False
         _cpa_log(f"SSO → 授权码流程换 token (proxy={proxy}) ...")
-        token = _s2cpa.sso_to_token(sso, proxy=proxy, log=_cpa_log)
+        token = _s2cpa.sso_to_token(
+            sso,
+            proxy=proxy,
+            log=_cpa_log,
+            should_stop=should_stop,
+        )
         if not token:
+            if should_stop and should_stop():
+                _cpa_log("用户停止，SSO 已保存在 accounts 文件")
+                return False
             _cpa_log("授权码流程换 token 失败；SSO 已在 accounts 文件，稍后可重转")
             _append_sso_pending(email, sso, log_callback=log_callback)
+            return False
+        if should_stop and should_stop():
+            _cpa_log("用户停止，跳过 auth 写入")
             return False
         record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
         ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
@@ -529,6 +542,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             except Exception as local_exc:
                 _cpa_log(f"本地写入失败: {local_exc}")
         if remote_url:
+            if should_stop and should_stop():
+                _cpa_log("用户停止，跳过远程上传")
+                return wrote_ok
             try:
                 name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
                 _cpa_log(f"已上传远程 {remote_url.rstrip('/')}/.../{name}")
@@ -541,6 +557,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             return False
         return True
     except Exception as exc:
+        if should_stop and should_stop():
+            _cpa_log("用户停止，SSO 已保存在 accounts 文件")
+            return False
         _cpa_log(f"直出失败: {exc}")
         _append_sso_pending(email, sso, log_callback=log_callback)
         return False
@@ -1214,7 +1233,7 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
-def enable_nsfw_via_browser(token="", log_callback=None):
+def enable_nsfw_via_browser(token="", log_callback=None, cancel_callback=None):
     """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
     page_obj = _active_page()
     if page_obj is None:
@@ -1224,7 +1243,12 @@ def enable_nsfw_via_browser(token="", log_callback=None):
     nsfw_bytes = encode_grpc_nsfw_settings()
     nsfw_b64 = base64.b64encode(nsfw_bytes).decode("ascii")
 
+    def _cancelled():
+        return bool(cancel_callback and cancel_callback())
+
     try:
+        if _cancelled():
+            return False, "用户已停止"
         if log_callback:
             log_callback("[*] 浏览器内开启 NSFW：打开 grok.com ...")
         # 确保 SSO cookie 在浏览器上下文中
@@ -1250,6 +1274,8 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                     )
                 except Exception:
                     pass
+        if _cancelled():
+            return False, "用户已停止"
         page_obj.get("https://grok.com/")
         try:
             page_obj.wait.doc_loaded()
@@ -1257,6 +1283,8 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
             pass
         # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
         for i in range(25):
+            if _cancelled():
+                return False, "用户已停止"
             try:
                 title = str(page_obj.run_js("return document.title || '';") or "").lower()
                 body = str(
@@ -1275,6 +1303,9 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
             if log_callback:
                 log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
         time.sleep(1.0)
+
+        if _cancelled():
+            return False, "用户已停止"
 
         result = page_obj.run_js(
             r"""
@@ -1370,7 +1401,13 @@ return (async () => {
         return False, f"浏览器内 NSFW 异常: {exc}"
 
 
-def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=None):
+def enable_nsfw_for_token(
+    token,
+    cf_clearance="",
+    user_agent="",
+    log_callback=None,
+    cancel_callback=None,
+):
     proxies = get_proxies()
     ua = user_agent or get_user_agent()
     if log_callback:
@@ -1378,17 +1415,28 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
             f"[Debug] NSFW 准备: cf_clearance={'有' if cf_clearance else '无'} | ua_len={len(ua)} | browser={'有' if _active_page() else '无'}"
         )
 
+    def _cancelled():
+        return bool(cancel_callback and cancel_callback())
+
     def _browser_fallback(reason):
+        if _cancelled():
+            return False, "用户已停止"
         if _active_page() is None:
             return False, reason
         if log_callback:
             log_callback(f"[*] NSFW HTTP 快速路径未成功: {reason}，回退浏览器过盾...")
-        ok, message = enable_nsfw_via_browser(token=token, log_callback=log_callback)
+        ok, message = enable_nsfw_via_browser(
+            token=token,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
         if ok:
             return True, message
         return False, f"{reason}; browser fallback: {message}"
 
     try:
+        if _cancelled():
+            return False, "用户已停止"
         if log_callback:
             log_callback("[*] NSFW 先尝试 HTTP 快速路径...")
         with requests.Session(impersonate="chrome120", proxies=proxies) as session:
@@ -1406,9 +1454,13 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
             ok, message = set_tos_accepted(session, log_callback)
             if not ok:
                 return _browser_fallback(message)
+            if _cancelled():
+                return False, "用户已停止"
             ok, message = set_birth_date(session, log_callback)
             if not ok:
                 return _browser_fallback(message)
+            if _cancelled():
+                return False, "用户已停止"
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
                 return _browser_fallback(message)
@@ -1519,14 +1571,8 @@ def tk_option_menu(parent, variable, values, width=12):
     menu["menu"].configure(bg=UI_ENTRY_BG, fg=UI_FG, activebackground=UI_ACTIVE_BG, activeforeground=UI_FG)
     return menu
 
-def is_debug_mode():
-    return bool(config.get("debug_mode", False))
-
-
 def should_close_browser_after_run(user_stopped: bool) -> bool:
-    """正常结束默认关浏览器；用户主动停止时由 close_browser_on_stop 控制。调试模式始终保留。"""
-    if is_debug_mode():
-        return False
+    """正常结束默认关浏览器；用户主动停止时由 close_browser_on_stop 控制。"""
     if user_stopped and not config.get("close_browser_on_stop", False):
         return False
     return True
@@ -1557,7 +1603,7 @@ def should_emit_log(message: str) -> bool:
 
 def _wire_runtime_modules():
     """把主模块依赖注入到 browser_session / register_flow。"""
-    _bs.configure(get_proxies=get_proxies, is_debug=is_debug_mode, extension_path=EXTENSION_PATH)
+    _bs.configure(get_proxies=get_proxies, extension_path=EXTENSION_PATH)
     _rf.configure(
         get_email_and_token=get_email_and_token,
         get_oai_code=get_oai_code,
@@ -1687,11 +1733,6 @@ class GrokRegisterGUI:
         self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
         self.nsfw_check = tk_checkbutton(opt_frame, text="注册后开启 NSFW（可选）", variable=self.nsfw_var)
         self.nsfw_check.pack(side=tk.LEFT)
-        self.debug_mode_var = tk.BooleanVar(value=bool(config.get("debug_mode", False)))
-        self.debug_mode_check = tk_checkbutton(
-            opt_frame, text="调试模式（可选）", variable=self.debug_mode_var
-        )
-        self.debug_mode_check.pack(side=tk.LEFT, padx=(12, 0))
         self.log_level_var = tk.StringVar(value=str(config.get("log_level", "info") or "info"))
         tk_label(opt_frame, text="日志:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
         self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
@@ -2171,12 +2212,19 @@ class GrokRegisterGUI:
                     result = {"total": 0, "ok": 0, "skipped": 0, "fail": 0, "stopped": False}
                     self.log("[补转] [!] 未找到可转换的 SSO")
                 else:
+                    try:
+                        workers = int(self.workers_var.get() or 1)
+                    except Exception:
+                        workers = int(config.get("register_workers", 1) or 1)
+                    workers = max(1, min(workers, 8))
+                    self.log(f"[补转] 并发分片 workers={workers}")
                     result = _s2cpa.convert_sso_entries(
                         entries,
                         cpa_auth_dir=config["cpa_auth_dir"] or None,
                         cpa_remote_url=config["cpa_remote_url"] or None,
                         cpa_management_key=config["cpa_management_key"] or None,
                         proxy=config["proxy"],
+                        workers=workers,
                         log=lambda message: self.log(f"[补转] {str(message).strip()}"),
                         should_stop=lambda: self.sso_convert_stop_requested,
                     )
@@ -2258,7 +2306,6 @@ class GrokRegisterGUI:
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
-        config["debug_mode"] = bool(self.debug_mode_var.get())
         config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
         config["log_level"] = (self.log_level_var.get().strip() or "info").lower()
         config["proxy"] = self.proxy_var.get().strip()
@@ -2321,13 +2368,6 @@ class GrokRegisterGUI:
             workers = int(self.workers_var.get())
         except Exception:
             workers = 1
-        if config.get("debug_mode"):
-            if count != 1 or workers != 1:
-                self.log("[*] 调试模式：强制 数量=1、并发=1，结束后不关闭浏览器")
-            count = 1
-            workers = 1
-            self.count_var.set("1")
-            self.workers_var.set("1")
         workers = max(1, min(workers, 8, count))
         config["register_count"] = count
         config["register_workers"] = workers
@@ -2360,9 +2400,8 @@ class GrokRegisterGUI:
             self.log(f"[!] 连通性检查异常: {exc}")
         self.log(
             f"[*] 配置已保存，开始执行。目标数量: {count} | 并发: {workers}"
-            + (" | 调试模式" if config.get("debug_mode") else "")
         )
-        if int(self.workers_var.get() or 1) > count and not config.get("debug_mode"):
+        if int(self.workers_var.get() or 1) > count:
             self.log(f"[*] 并发已自动调整为 {workers}（不超过注册数量）")
         self.log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
@@ -2374,10 +2413,20 @@ class GrokRegisterGUI:
 
     def stop_registration(self):
         if self.sso_convert_running and not self.is_running:
+            if self.sso_convert_stop_requested:
+                return
             self.sso_convert_stop_requested = True
+            self.stop_btn.config(state=tk.DISABLED)
+            self.status_var.set("正在停止 SSO 补转...")
+            self.status_label.config(foreground="orange")
             self.log("[!] 用户停止 SSO 补转（当前账号完成后停止）")
             return
+        if self.stop_requested:
+            return
         self.stop_requested = True
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_var.set("正在停止...")
+        self.status_label.config(foreground="orange")
         # 即时写入，worker finally 能读到最新勾选状态
         config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
         keep = not config.get("close_browser_on_stop", False)
@@ -2397,6 +2446,8 @@ class GrokRegisterGUI:
                 self.log(f"[*] 实际并发 worker={len(chunks)}，分片={chunks}")
                 threads = []
                 for wid, n in enumerate(chunks):
+                    if self.should_stop():
+                        break
                     t = threading.Thread(
                         target=self.run_registration,
                         args=(n, wid, len(chunks)),
@@ -2405,9 +2456,13 @@ class GrokRegisterGUI:
                     t.start()
                     threads.append(t)
                     # 错开启动，降低同时拉起 Chrome 端口/用户目录冲突
-                    time.sleep(2.0)
+                    try:
+                        sleep_with_cancel(2.0, self.should_stop)
+                    except RegistrationCancelled:
+                        break
                 for t in threads:
-                    t.join()
+                    while t.is_alive():
+                        t.join(timeout=0.2)
         finally:
             # 协调线程自身无浏览器；各 worker 线程 finally 已各自 stop
             self._set_running_ui(False)
@@ -2507,7 +2562,9 @@ class GrokRegisterGUI:
                         wlog("[*] 6. 开启 NSFW（失败不阻塞入库）")
                         try:
                             nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                                sso, log_callback=wlog
+                                sso,
+                                log_callback=wlog,
+                                cancel_callback=self.should_stop,
                             )
                             if nsfw_ok:
                                 wlog(f"[+] NSFW 开启成功: {nsfw_msg}")
@@ -2535,7 +2592,12 @@ class GrokRegisterGUI:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
-                    cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    cpa_ok = add_sso_to_cpa(
+                        sso,
+                        email=email,
+                        log_callback=wlog,
+                        should_stop=self.should_stop,
+                    )
                     self._record_success()
                     retry_count_for_slot = 0
                     i += 1
@@ -2609,13 +2671,13 @@ class GrokRegisterGUI:
 
 class CliStopController:
     def __init__(self):
-        self.stop_requested = False
+        self._stop_event = threading.Event()
 
     def should_stop(self):
-        return self.stop_requested
+        return self._stop_event.is_set()
 
     def stop(self):
-        self.stop_requested = True
+        self._stop_event.set()
 
 
 def cli_log(message):
@@ -2717,6 +2779,7 @@ def run_registration_cli(count):
                             enable_nsfw_for_token(
                                 sso,
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                cancel_callback=controller.should_stop,
                             )
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         try:
@@ -2734,7 +2797,10 @@ def run_registration_cli(count):
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
                         cpa_ok = add_sso_to_cpa(
-                            sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                            sso,
+                            email=email,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            should_stop=controller.should_stop,
                         )
                         local_success += 1
                         i += 1
@@ -2795,8 +2861,18 @@ def run_registration_cli(count):
             t = threading.Thread(target=worker, args=(n, wid), daemon=True)
             t.start()
             threads.append(t)
-        for t in threads:
-            t.join()
+        try:
+            while any(t.is_alive() for t in threads):
+                for t in threads:
+                    t.join(timeout=0.2)
+        except KeyboardInterrupt:
+            controller.stop()
+            cli_log("[!] 强制中断多并发任务")
+            try:
+                signal.signal(signal.SIGINT, _prev_sigint)
+            except Exception:
+                pass
+            return
         success_count = shared["success"]
         fail_count = shared["fail"]
         fail_stats = shared["fail_stats"]
@@ -2884,7 +2960,9 @@ def run_registration_cli(count):
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=cli_log
+                        sso,
+                        log_callback=cli_log,
+                        cancel_callback=controller.should_stop,
                     )
                     if nsfw_ok:
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
@@ -2898,7 +2976,12 @@ def run_registration_cli(count):
                     cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                cpa_ok = add_sso_to_cpa(
+                    sso,
+                    email=email,
+                    log_callback=cli_log,
+                    should_stop=controller.should_stop,
+                )
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
@@ -2994,10 +3077,6 @@ def main_cli():
     load_config()
     _wire_runtime_modules()
     count = int(config.get("register_count", 1) or 1)
-    if config.get("debug_mode"):
-        count = 1
-        config["register_workers"] = 1
-        cli_log("[*] 调试模式：强制单账号，结束后不关闭浏览器")
     cli_log("[*] CLI 已加载配置")
     cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")

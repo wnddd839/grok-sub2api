@@ -8,7 +8,7 @@ import browser_session as bs
 
 class BrowserSessionTests(unittest.TestCase):
     def setUp(self):
-        bs.configure(get_proxies=lambda: {}, is_debug=lambda: False, extension_path="")
+        bs.configure(get_proxies=lambda: {}, extension_path="")
         bs.set_browser_session(None, None)
 
     def test_create_options_unique_profile(self):
@@ -25,7 +25,6 @@ class BrowserSessionTests(unittest.TestCase):
         proxy = "http://127.0.0.1:9999"
         bs.configure(
             get_proxies=lambda: {"http": proxy, "https": proxy},
-            is_debug=lambda: False,
             extension_path="",
         )
         opts = bs.create_browser_options(unique_profile=False)
@@ -48,14 +47,11 @@ class BrowserSessionTests(unittest.TestCase):
                 bs.start_browser(log_callback=None)
         self.assertGreaterEqual(bs.get_start_fail_streak(), before + 1)
 
-    def test_debug_mode_skips_stop(self):
-        bs.configure(get_proxies=lambda: {}, is_debug=lambda: True, extension_path="")
+    def test_stop_browser_always_quits(self):
         mock_browser = MagicMock()
         bs.set_browser_session(mock_browser, object())
-        bs.stop_browser(force=False)
-        mock_browser.quit.assert_not_called()
-        bs.stop_browser(force=True)
-        mock_browser.quit.assert_called()
+        bs.stop_browser()
+        mock_browser.quit.assert_called_once()
 
 
 if __name__ == "__main__":

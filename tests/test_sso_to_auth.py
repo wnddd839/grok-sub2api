@@ -10,6 +10,44 @@ import sso_to_auth_json as s2a
 
 
 class ExtractNextActionTests(unittest.TestCase):
+    def test_sso_to_token_honors_pre_cancel_without_network(self):
+        with patch.object(
+            s2a.requests,
+            "Session",
+            side_effect=AssertionError("cancelled conversion must not start a session"),
+        ):
+            self.assertIsNone(
+                s2a.sso_to_token(
+                    "valid-sso",
+                    log=lambda message: None,
+                    should_stop=lambda: True,
+                )
+            )
+
+    def test_action_discovery_stops_between_chunks(self):
+        class FakeResponse:
+            text = 'createServerReference("4001401a617b1234567890123456789012345678", callServer)'
+
+        class FakeSession:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url, **kwargs):
+                self.urls.append(url)
+                return FakeResponse()
+
+        session = FakeSession()
+        html = "".join(
+            f'<script src="/_next/static/chunks/{index}.js"></script>'
+            for index in range(5)
+        )
+        s2a._discover_action_ids_from_js(
+            session,
+            html,
+            should_stop=lambda: len(session.urls) >= 1,
+        )
+        self.assertEqual(len(session.urls), 1)
+
     def test_parse_sso_line_keeps_email_prefix(self):
         self.assertEqual(
             s2a.parse_sso_line("user@example.com----password----sso-value"),
@@ -134,6 +172,76 @@ class ExtractNextActionTests(unittest.TestCase):
             )
         get.assert_called_once()
         response.raise_for_status.assert_called_once()
+
+    def test_remote_cpa_is_authoritative_for_existing_email(self):
+        logs = []
+        with patch.object(
+            s2a,
+            "collect_existing_auth_emails",
+            return_value=set(),
+        ), patch.object(
+            s2a,
+            "collect_remote_auth_emails",
+            return_value={"user@example.com"},
+        ), patch.object(
+            s2a,
+            "sso_to_token",
+            side_effect=AssertionError("remote existing account must be skipped"),
+        ):
+            result = s2a.convert_sso_entries(
+                [("user@example.com", "sso-value")],
+                cpa_auth_dir="local-auths",
+                cpa_remote_url="http://127.0.0.1:8317",
+                cpa_management_key="key",
+                log=logs.append,
+            )
+
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["ok"], 0)
+
+    def test_local_json_does_not_hide_remote_missing_email(self):
+        token = {"access_token": "token", "expires_in": 21600}
+        entry = {"user_id": "user-id", "email": "user@example.com", "key": "token"}
+        with patch.object(
+            s2a,
+            "collect_existing_auth_emails",
+            return_value={"user@example.com"},
+        ), patch.object(
+            s2a,
+            "collect_remote_auth_emails",
+            return_value=set(),
+        ), patch.object(
+            s2a,
+            "sso_to_token",
+            return_value=token,
+        ) as exchange, patch.object(
+            s2a,
+            "token_to_auth_entry",
+            return_value=("auth-key", entry),
+        ), patch.object(
+            s2a,
+            "token_to_cpa_record",
+            return_value={"email": "user@example.com", "access_token": "token"},
+        ), patch.object(
+            s2a,
+            "write_cpa_auth",
+            return_value=Path("xai-user@example.com.json"),
+        ), patch.object(
+            s2a,
+            "upload_cpa_auth_remote",
+            return_value="xai-user@example.com.json",
+        ):
+            result = s2a.convert_sso_entries(
+                [("user@example.com", "sso-value")],
+                cpa_auth_dir="local-auths",
+                cpa_remote_url="http://127.0.0.1:8317",
+                cpa_management_key="key",
+                log=lambda message: None,
+            )
+
+        exchange.assert_called_once()
+        self.assertEqual(result["ok"], 1)
+        self.assertEqual(result["skipped"], 0)
 
     def test_extract_create_server_reference(self):
         html = 'createServerReference("401b73e22a5e68737d0037e1aa449fef82cd1b35fb", callServer)'

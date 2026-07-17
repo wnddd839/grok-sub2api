@@ -15,17 +15,15 @@ from DrissionPage import Chromium, ChromiumOptions
 
 _tls = threading.local()
 _get_proxy: Optional[Callable[[], dict]] = None
-_is_debug: Optional[Callable[[], bool]] = None
 _extension_path: str = ""
 _start_fail_lock = threading.Lock()
 _start_fail_streak = 0
 _start_fail_threshold = 3
 
 
-def configure(get_proxies=None, is_debug=None, extension_path=""):
-    global _get_proxy, _is_debug, _extension_path
+def configure(get_proxies=None, extension_path=""):
+    global _get_proxy, _extension_path
     _get_proxy = get_proxies
-    _is_debug = is_debug
     _extension_path = extension_path or ""
 
 
@@ -51,10 +49,6 @@ def _proxies() -> dict:
     if _get_proxy:
         return _get_proxy() or {}
     return {}
-
-
-def _debug() -> bool:
-    return bool(_is_debug()) if _is_debug else False
 
 
 def active_browser():
@@ -174,9 +168,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
-def stop_browser(force=False):
-    if _debug() and not force:
-        return
+def stop_browser():
     current = active_browser()
     set_browser_session(None, None)
     if current is None:
@@ -188,29 +180,21 @@ def stop_browser(force=False):
 
 
 def restart_browser(log_callback=None):
-    stop_browser(force=True)
+    stop_browser()
     return start_browser(log_callback=log_callback)
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
     try:
-        if _debug():
-            if log_callback:
-                log_callback(f"[*] 调试模式：保留浏览器（{reason}）")
-            collected = gc.collect()
-            if log_callback:
-                log_callback(f"[*] Python GC 已回收对象数: {collected}")
-            return
         if log_callback:
             log_callback(f"[*] {reason}: 关闭浏览器并清理内存")
-        stop_browser(force=True)
+        stop_browser()
         collected = gc.collect()
         if log_callback:
             log_callback(f"[*] Python GC 已回收对象数: {collected}")
     except BaseException:
         try:
-            if not _debug():
-                stop_browser(force=True)
+            stop_browser()
         except BaseException:
             pass
 

@@ -54,6 +54,7 @@ class ConnectivityTests(unittest.TestCase):
                 "cloudflare_api_base": "https://mail.example.com",
                 "cloudflare_api_key": "bad-secret",
                 "cloudflare_auth_mode": "x-api-key",
+                "cloudflare_path_accounts": "/admin/new_address",
             },
             lambda *a, **k: DummyResp(401),
             lambda *a, **k: DummyResp(),
@@ -61,12 +62,13 @@ class ConnectivityTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("401", detail)
 
-    def test_email_cloudflare_anonymous_direct_create_does_not_need_domains(self):
+    def test_email_cloudflare_direct_create_with_custom_auth_does_not_need_domains(self):
         name, ok, detail = connectivity.check_email_api(
             "cloudflare",
             {
                 "cloudflare_api_base": "https://mail.example.com",
                 "cloudflare_auth_mode": "none",
+                "cloudflare_custom_auth": "global-secret",
                 "cloudflare_path_accounts": "/api/new_address",
             },
             lambda *a, **k: DummyResp(401),

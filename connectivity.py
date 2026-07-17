@@ -75,17 +75,15 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
                     config.get("cloudflare_path_accounts", "/api/new_address")
                     or "/api/new_address"
                 ).rstrip("/").lower()
-                direct_anonymous_create = (
+                direct_create = (
                     accounts_path.endswith("/new_address")
-                    and not api_key
-                    and not custom_auth
-                    and auth_mode.lower() == "none"
+                    and not accounts_path.endswith("/admin/new_address")
                 )
-                if direct_anonymous_create and resp.status_code in (401, 403):
+                if direct_create and resp.status_code in (401, 403):
                     return (
                         "邮箱API",
                         True,
-                        f"Cloudflare 直建模式可用（domains HTTP {resp.status_code}，当前流程不依赖该接口）",
+                        f"Cloudflare 直建模式可继续（domains HTTP {resp.status_code}，注册流程不依赖该接口）",
                     )
                 return "邮箱API", False, f"Cloudflare HTTP {resp.status_code}"
             return "邮箱API", True, f"Cloudflare 可达 HTTP {resp.status_code}"
