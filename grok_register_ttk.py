@@ -40,7 +40,8 @@ from email_providers.common import generate_username as _generate_username
 from email_providers.common import pick_list_payload as _pick_list
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
 
 UI_BG = "#242424"
@@ -465,42 +466,49 @@ def wait_sub2api_pending(log_callback=None):
         executor.shutdown(wait=True, cancel_futures=False)
 
 
-def add_sso_to_cpa(raw_token, email="", log_callback=None):
-    """SSO → 换 token → 写入本地 CPA auth 目录和/或远程 CPA。
+def _append_sso_pending(email: str, sso: str, log_callback=None):
+    """CPA 失败时保留 SSO，便于事后补转。"""
+    try:
+        path = os.path.join(APP_DIR, "sso_pending.txt")
+        line = f"{email}----{sso}\n" if email else f"{sso}\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+        if log_callback:
+            log_callback(f"[CPA] 已追加待重转 SSO → {path}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[CPA] 写入 sso_pending 失败: {exc}")
 
-    SSO 本身不是 CPA 认的凭据；必须先换到 access/refresh token，
-    再写成 CPA 的 xai-<email>.json（type=xai + cli-chat-proxy base_url + grok-cli headers）。
-    实际的 SSO→token 换取流程由 sso_to_auth_json(_s2cpa) 决定（当前为 Device Flow）。
 
-    - 本地：写入 cpa_auth_dir，CPA 监听热加载
-    - 远程：POST Management API /v0/management/auth-files（cpa_remote_url + cpa_management_key）
-    - cpa_auto_add=false 时跳过转换，仅保留 accounts 文件里的 SSO
+def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
+    """SSO → 授权码流程换 token → 写入本地 CPA auth 目录和/或远程 CPA。
+
+    返回 True 表示 CPA 入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
     """
     if not config.get("cpa_auto_add", False):
         if log_callback:
             log_callback("[*] 已关闭 SSO→CPA auth，仅保存 SSO（不写 auth）")
-        return
+        return True
     auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
     management_key = str(config.get("cpa_management_key", "") or "").strip()
     if not auth_dir and not remote_url:
         if log_callback:
             log_callback("[Debug] 已开启 CPA 直出但未配置 cpa_auth_dir 或 cpa_remote_url，跳过")
-        return
+        return True
     if remote_url and not management_key:
         if log_callback:
             log_callback("[Debug] 已配置 cpa_remote_url 但未配置 cpa_management_key，跳过远程上传")
         remote_url = ""
     if not auth_dir and not remote_url:
-        return
+        return True
     sso = _normalize_sso_token(raw_token)
     if not sso:
-        return
+        return False
     proxy = _resolve_cpa_proxy()
 
     def _cpa_log(message):
         if log_callback:
-            # Windows 控制台/部分 UI 回调默认 GBK，emoji 会导致整段 CPA 直出中断
             text = str(message).strip()
             try:
                 text.encode("gbk")
@@ -509,50 +517,69 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
             log_callback(f"[CPA] {text}")
 
     try:
-        _cpa_log(f"SSO → 换 token (proxy={proxy}) ...")
-        token = _s2cpa.sso_to_token(sso, proxy=proxy, log=_cpa_log)
+        if should_stop and should_stop():
+            _cpa_log("用户停止，跳过授权转换")
+            return False
+        _cpa_log(f"SSO → 授权码流程换 token (proxy={proxy}) ...")
+        token = _s2cpa.sso_to_token(
+            sso,
+            proxy=proxy,
+            log=_cpa_log,
+            should_stop=should_stop,
+        )
         if not token:
-            _cpa_log("换 token 失败，跳过")
-            return
-        # 兼容授权码流程（token_to_cpa_record 接受 sso 参数）与 device-flow（不接受）
-        try:
-            import inspect
-
-            _accepts_sso = "sso" in inspect.signature(
-                _s2cpa.token_to_cpa_record
-            ).parameters
-        except (TypeError, ValueError):
-            _accepts_sso = False
-        if _accepts_sso:
-            record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
-        else:
-            record = _s2cpa.token_to_cpa_record(token, email=email)
+            if should_stop and should_stop():
+                _cpa_log("用户停止，SSO 已保存在 accounts 文件")
+                return False
+            _cpa_log("授权码流程换 token 失败；SSO 已在 accounts 文件，稍后可重转")
+            _append_sso_pending(email, sso, log_callback=log_callback)
+            return False
+        if should_stop and should_stop():
+            _cpa_log("用户停止，跳过 auth 写入")
+            return False
+        record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
         try:
             ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
             ref = ap.get("referrer")
-            if ref == "grok-build":
+            if ref != "grok-build":
+                _cpa_log(f"警告: access_token referrer={ref!r}，预期 grok-build")
+            else:
                 _cpa_log("access_token referrer=grok-build OK")
-            elif ref:
-                _cpa_log(f"提示: access_token referrer={ref!r}")
         except Exception:
             pass
+        wrote_ok = False
         if auth_dir:
             try:
                 path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
                 _cpa_log(f"已写入本地 {path}")
+                wrote_ok = True
             except Exception as local_exc:
                 _cpa_log(f"本地写入失败: {local_exc}")
         if remote_url:
+            if should_stop and should_stop():
+                _cpa_log("用户停止，跳过远程上传")
+                return wrote_ok
             try:
                 name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
                 _cpa_log(f"已上传远程 {remote_url.rstrip('/')}/.../{name}")
+                wrote_ok = True
             except Exception as remote_exc:
                 _cpa_log(f"远程上传失败: {remote_exc}")
+        if not wrote_ok:
+            _cpa_log("token 已换出但本地/远程均未写入成功")
+            _append_sso_pending(email, sso, log_callback=log_callback)
+            return False
+        return True
     except Exception as exc:
+        if should_stop and should_stop():
+            _cpa_log("用户停止，SSO 已保存在 accounts 文件")
+            return False
         _cpa_log(f"直出失败: {exc}")
+        _append_sso_pending(email, sso, log_callback=log_callback)
+        return False
 
 
-def add_sso_to_sub2api(raw_token, email="", log_callback=None):
+def add_sso_to_sub2api(raw_token, email="", log_callback=None, should_stop=None):
     """SSO → 换 token → 验活 →（可选）写导入包 / 远程创建。
 
     返回 Future[bool]：仅当换 token 成功，且（未开验活或验活通过）时为 True。
@@ -626,7 +653,10 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None):
         try:
             _s2_log(f"{label}: SSO → 换 token ...")
             token = _s2cpa.sso_to_token(
-                payload["sso"], proxy=payload["proxy"], log=_s2_log
+                payload["sso"],
+                proxy=payload["proxy"],
+                log=_s2_log,
+                should_stop=should_stop,
             )
             if not token:
                 _s2_log(f"{label}: 换 token 失败")
@@ -2857,6 +2887,8 @@ class GrokRegisterGUI:
         self.root.geometry("1120x900")
         self.root.minsize(960, 700)
         self.is_running = False
+        self.sso_convert_running = False
+        self.sso_convert_stop_requested = False
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
@@ -2864,7 +2896,31 @@ class GrokRegisterGUI:
         self.stop_requested = False
         self.ui_queue = queue.Queue()
         self.accounts_output_file = ""
+        self._ui_thread_id = threading.get_ident()
         self.setup_ui()
+        self.root.after(50, self._drain_ui_queue)
+
+    def _queue_ui_call(self, callback, *args):
+        if threading.get_ident() == self._ui_thread_id:
+            return False
+        self.ui_queue.put((callback, args))
+        return True
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                callback, args = self.ui_queue.get_nowait()
+                try:
+                    callback(*args)
+                except Exception as exc:
+                    try:
+                        print(f"[UI] callback error: {exc}", flush=True)
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(50, self._drain_ui_queue)
 
     def setup_ui(self):
         load_config()
@@ -3243,6 +3299,12 @@ class GrokRegisterGUI:
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = tk_button(btn_frame, text="停止", command=self.stop_registration, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.sso_convert_btn = tk_button(
+            btn_frame,
+            text="补转缺失 SSO",
+            command=self.start_sso_recovery,
+        )
+        self.sso_convert_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
 
@@ -3322,6 +3384,8 @@ class GrokRegisterGUI:
                 widget.grid_remove()
 
     def log(self, message):
+        if self._queue_ui_call(self.log, message):
+            return
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         print(line, flush=True)
@@ -3332,6 +3396,8 @@ class GrokRegisterGUI:
         self.log_text.delete(1.0, tk.END)
 
     def update_stats(self):
+        if self._queue_ui_call(self.update_stats):
+            return
         fail_detail = format_fail_stats(getattr(self, "fail_stats", {}) or {})
         if self.fail_count:
             self.stats_var.set(
@@ -3365,9 +3431,13 @@ class GrokRegisterGUI:
             self.success_count += 1
 
     def _set_running_ui(self, running):
+        if self._queue_ui_call(self._set_running_ui, running):
+            return
         self.is_running = running
-        self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
-        self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+        busy = running or self.sso_convert_running
+        self.start_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self.sso_convert_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
 
@@ -3377,6 +3447,9 @@ class GrokRegisterGUI:
     def start_registration(self):
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
+            return
+        if self.sso_convert_running:
+            self.log("[!] SSO 补转正在运行，请结束后再开始注册")
             return
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
@@ -3479,7 +3552,103 @@ class GrokRegisterGUI:
             daemon=True,
         ).start()
 
+    def start_sso_recovery(self):
+        if self.is_running:
+            self.log("[!] 注册任务正在运行，请结束后再补转 SSO")
+            return
+        if self.sso_convert_running:
+            self.log("[!] SSO 补转已经在运行")
+            return
+
+        config["proxy"] = self.proxy_var.get().strip()
+        config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
+        config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
+        config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        if not config["cpa_auth_dir"] and not config["cpa_remote_url"]:
+            self.log("[!] 请先配置 CPA auth 目录或远程地址")
+            return
+        if config["cpa_remote_url"] and not config["cpa_management_key"]:
+            self.log("[!] 已配置 CPA 远程地址，但缺少管理密钥")
+            return
+        save_config()
+
+        self.sso_convert_running = True
+        self.sso_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED)
+        self.sso_convert_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.status_var.set("SSO 补转中...")
+        self.status_label.config(foreground="blue")
+        self.log("[*] 开始扫描 accounts_*.txt 和 sso_pending.txt，补转缺失 SSO...")
+
+        def _job():
+            result = None
+            error = ""
+            try:
+                entries, files = _s2cpa.scan_sso_entries(APP_DIR)
+                self.log(
+                    f"[补转] 扫描到 {len(files)} 个 TXT，"
+                    f"去重后 {len(entries)} 个 SSO"
+                )
+                if not entries:
+                    result = {"total": 0, "ok": 0, "skipped": 0, "fail": 0, "stopped": False}
+                    self.log("[补转] [!] 未找到可转换的 SSO")
+                else:
+                    try:
+                        workers = int(self.workers_var.get() or 1)
+                    except Exception:
+                        workers = int(config.get("register_workers", 1) or 1)
+                    workers = max(1, min(workers, 8))
+                    self.log(f"[补转] 并发分片 workers={workers}")
+                    result = _s2cpa.convert_sso_entries(
+                        entries,
+                        cpa_auth_dir=config["cpa_auth_dir"] or None,
+                        cpa_remote_url=config["cpa_remote_url"] or None,
+                        cpa_management_key=config["cpa_management_key"] or None,
+                        proxy=config["proxy"],
+                        workers=workers,
+                        log=lambda message: self.log(f"[补转] {str(message).strip()}"),
+                        should_stop=lambda: self.sso_convert_stop_requested,
+                    )
+            except Exception as exc:
+                error = str(exc)
+            self.ui_queue.put((self._on_sso_recovery_done, (result, error)))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_sso_recovery_done(self, result, error):
+        self.sso_convert_running = False
+        self.sso_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.sso_convert_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if self.is_running else tk.DISABLED)
+        if error:
+            self.log(f"[补转] [-] 任务异常: {error}")
+            self.status_var.set("SSO 补转失败")
+            self.status_label.config(foreground="red")
+            return
+
+        result = result or {}
+        if result.get("stopped"):
+            self.status_var.set("SSO 补转已停止")
+            self.status_label.config(foreground="orange")
+        elif result.get("fail"):
+            self.status_var.set("SSO 补转有失败项")
+            self.status_label.config(foreground="orange")
+        else:
+            self.status_var.set("SSO 补转完成")
+            self.status_label.config(foreground="green")
+
     def stop_registration(self):
+        if self.sso_convert_running and not self.is_running:
+            if self.sso_convert_stop_requested:
+                return
+            self.sso_convert_stop_requested = True
+            self.stop_btn.config(state=tk.DISABLED)
+            self.status_var.set("正在停止 SSO 补转...")
+            self.status_label.config(foreground="orange")
+            self.log("[!] 用户停止 SSO 补转（当前账号完成后停止）")
+            return
         self.stop_requested = True
         self.log("[!] 用户停止注册")
 
@@ -3612,11 +3781,11 @@ class GrokRegisterGUI:
                             wlog(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                     lock = getattr(self, "_stats_lock", None)
                     export_ok = wait_sub2api_account_result(
-                        add_sso_to_sub2api(sso, email=email, log_callback=wlog)
+                        add_sso_to_sub2api(sso, email=email, log_callback=wlog, should_stop=self.should_stop)
                     )
                     if not export_ok:
                         raise Exception("换 token 或验活失败，不计入成功")
-                    add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    add_sso_to_cpa(sso, email=email, log_callback=wlog, should_stop=self.should_stop)
                     if lock:
                         with lock:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
@@ -3822,11 +3991,12 @@ def run_registration_cli(count):
                                 sso,
                                 email=email,
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                should_stop=controller.should_stop,
                             )
                         )
                         if not export_ok:
                             raise Exception("换 token 或验活失败，不计入成功")
-                        add_sso_to_cpa(sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
+                        add_sso_to_cpa(sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"), should_stop=controller.should_stop)
                         with accounts_lock:
                             with open(accounts_output_file, "a", encoding="utf-8") as f:
                                 f.write(line)
@@ -3978,11 +4148,11 @@ def run_registration_cli(count):
                 except Exception:
                     line = f"{email}--------{sso}\n"
                 export_ok = wait_sub2api_account_result(
-                    add_sso_to_sub2api(sso, email=email, log_callback=cli_log)
+                    add_sso_to_sub2api(sso, email=email, log_callback=cli_log, should_stop=controller.should_stop)
                 )
                 if not export_ok:
                     raise Exception("换 token 或验活失败，不计入成功")
-                add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                add_sso_to_cpa(sso, email=email, log_callback=cli_log, should_stop=controller.should_stop)
                 try:
                     with open(accounts_output_file, "a", encoding="utf-8") as f:
                         f.write(line)
