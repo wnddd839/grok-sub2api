@@ -17,6 +17,8 @@ htmlcov/
 config.json
 config.local.json
 config.local.*
+proxies.txt
+!proxies.txt.example
 *.bak
 .env
 .env.*
@@ -55,6 +57,7 @@ _compare_cpa.py
 _compare_*.py
 _merge_*.py
 tools/.tmp*
+tools/_tmp*
 tools/_compare_*.py
 tools/upstream_snap/
 .upstream_snap/
