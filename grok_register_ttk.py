@@ -1154,6 +1154,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
             proxy=proxy,
             log=_cpa_log,
             should_stop=should_stop,
+            flow="device",
         )
         if not token:
             if should_stop and should_stop():
@@ -1293,13 +1294,26 @@ def add_sso_to_sub2api(raw_token, email="", password="", log_callback=None, shou
     def _worker(payload) -> bool:
         label = payload["email"] or "account"
         try:
-            _s2_log(f"{label}: SSO → 换 token ...")
+            _s2_log(f"{label}: SSO → PKCE 换 token (referrer=grok-build) ...")
+            used_flow = "pkce"
             token = _s2cpa.sso_to_token(
                 payload["sso"],
                 proxy=payload["proxy"],
                 log=_s2_log,
                 should_stop=should_stop,
+                flow="pkce",
             )
+            if not token:
+                # PKCE 失败时短暂尝试 Device，便于后续 403 再 PKCE 重铸
+                _s2_log(f"{label}: PKCE 失败，尝试 Device Flow ...")
+                used_flow = "device"
+                token = _s2cpa.sso_to_token(
+                    payload["sso"],
+                    proxy=payload["proxy"],
+                    log=_s2_log,
+                    should_stop=should_stop,
+                    flow="device",
+                )
             if not token:
                 _s2_log(f"{label}: 换 token 失败")
                 return False
@@ -1311,6 +1325,25 @@ def add_sso_to_sub2api(raw_token, email="", password="", log_callback=None, shou
                 verdict, message = _s2cpa.verify_grok_chat(
                     creds, proxy=payload["proxy"]
                 )
+                if verdict == _s2cpa.VERDICT_DROP_403 and used_flow == "device":
+                    _s2_log(f"{label}: Device token 403，改用 PKCE 重铸一次 ...")
+                    token = _s2cpa.sso_to_token(
+                        payload["sso"],
+                        proxy=payload["proxy"],
+                        log=_s2_log,
+                        should_stop=should_stop,
+                        flow="pkce",
+                    )
+                    if token:
+                        used_flow = "pkce"
+                        creds = _s2cpa.token_to_sub2api_credentials(
+                            token, email=payload["email"]
+                        )
+                        verdict, message = _s2cpa.verify_grok_chat(
+                            creds, proxy=payload["proxy"]
+                        )
+                    else:
+                        verdict, message = _s2cpa.VERDICT_DROP_403, message
                 if verdict == _s2cpa.VERDICT_DROP_403:
                     _s2_log(f"{label}: 403 丢弃 ({message})")
                     persist_discard_403(

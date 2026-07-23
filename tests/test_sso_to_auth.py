@@ -281,6 +281,7 @@ class ExtractNextActionTests(unittest.TestCase):
                 self.proxies = None
                 self.posts = []
                 self.gets = []
+                self.post_bodies = []
 
             def get(self, url, **kwargs):
                 self.gets.append(url)
@@ -296,6 +297,7 @@ class ExtractNextActionTests(unittest.TestCase):
 
             def post(self, url, **kwargs):
                 self.posts.append(url)
+                self.post_bodies.append(str(kwargs.get("data") or ""))
                 if url.endswith("/oauth2/device/auth") or "device/auth" in url or url.endswith("/device_authorization"):
                     return FakeResponse(
                         url,
@@ -334,7 +336,7 @@ class ExtractNextActionTests(unittest.TestCase):
 
         session = FakeSession()
         with patch.object(s2a.requests, "Session", return_value=session):
-            token = s2a.sso_to_token("valid-sso", log=lambda message: None)
+            token = s2a.sso_to_token("valid-sso", log=lambda message: None, flow="device")
 
         self.assertIsNotNone(token)
         self.assertEqual(token.get("access_token"), "not-a-jwt")
@@ -344,7 +346,78 @@ class ExtractNextActionTests(unittest.TestCase):
         self.assertTrue(any("device/approve" in u for u in session.posts))
         self.assertTrue(any("/oauth2/token" in u for u in session.posts))
         # Device flow must not inject referrer authorize params
-        self.assertNotIn("referrer=grok-build", " ".join(session.posts))
+        self.assertNotIn("referrer=grok-build", " ".join(session.post_bodies))
+
+    def test_sso_to_token_pkce_injects_referrer_grok_build(self):
+        class FakeCookies:
+            def set(self, *args, **kwargs):
+                return None
+
+        class FakeResponse:
+            def __init__(self, url, text="", status_code=200, payload=None, headers=None):
+                self.url = url
+                self.text = text
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.headers = headers or {}
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.cookies = FakeCookies()
+                self.proxies = None
+                self.posts = []
+                self.gets = []
+                self.get_urls = []
+                self.post_data = []
+
+            def get(self, url, **kwargs):
+                self.gets.append(url)
+                self.get_urls.append(url)
+                if "accounts.x.ai/" == url.rstrip("/") + "/" or url.rstrip("/") == "https://accounts.x.ai":
+                    return FakeResponse("https://accounts.x.ai/")
+                if "/oauth2/authorize" in url:
+                    return FakeResponse(
+                        "https://accounts.x.ai/oauth2/consent?state=x",
+                        text='createServerReference("40b1f238edcd2299db9b5d17c8777cfbab7cc3d889", callServer)',
+                    )
+                return FakeResponse(url)
+
+            def post(self, url, **kwargs):
+                self.posts.append(url)
+                self.post_data.append(str(kwargs.get("data") or ""))
+                if "/oauth2/consent" in url:
+                    return FakeResponse(
+                        url,
+                        text='0:{"a":"$@1"}\n1:{"success":true,"action":"allow","code":"auth-code-1"}\n',
+                    )
+                if "/oauth2/token" in url:
+                    return FakeResponse(
+                        url,
+                        payload={
+                            "access_token": "not-a-jwt",
+                            "refresh_token": "rt",
+                            "expires_in": 21600,
+                            "token_type": "Bearer",
+                        },
+                    )
+                return FakeResponse(url, status_code=500, text="unexpected")
+
+        session = FakeSession()
+        with patch.object(s2a.requests, "Session", return_value=session):
+            token = s2a.sso_to_token("valid-sso", log=lambda message: None, flow="pkce")
+
+        self.assertIsNotNone(token)
+        self.assertEqual(token.get("access_token"), "not-a-jwt")
+        authorize_hits = [u for u in session.get_urls if "/oauth2/authorize" in u]
+        self.assertTrue(authorize_hits)
+        self.assertIn("referrer=grok-build", authorize_hits[0])
+        self.assertIn("plan=generic", authorize_hits[0])
+        self.assertTrue(any("/oauth2/consent" in u for u in session.posts))
+        self.assertTrue(any("grant_type=authorization_code" in d for d in session.post_data))
+        self.assertTrue(any("code_verifier=" in d for d in session.post_data))
 
     def test_token_to_cpa_record_matches_healthy_headers(self):
         record = s2a.token_to_cpa_record(
@@ -363,8 +436,9 @@ class ExtractNextActionTests(unittest.TestCase):
         self.assertNotIn("redirect_uri", record)
         self.assertNotIn("disabled", record)
         self.assertEqual(s2a.SCOPES, "openid profile email offline_access grok-cli:access api:access")
-        self.assertEqual(s2a.GROK_REFERRER, "")
-
+        self.assertEqual(s2a.GROK_REFERRER, "grok-build")
+        self.assertEqual(s2a.GROK_PLAN, "generic")
+        self.assertNotIn("conversations:", s2a.SCOPES)
 
 if __name__ == "__main__":
     unittest.main()

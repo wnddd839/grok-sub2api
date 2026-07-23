@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-SSO cookie → CPA / grok auth.json 格式（纯 HTTP Device Authorization Flow）
+SSO cookie → CPA / Sub2API / grok auth.json 格式（纯 HTTP OAuth）
 
-对齐 grok-register-new / 健康号：
-- Device Flow（无 referrer / plan / conversations scope）
-- CPA headers 使用 grok-shell + x-compaction-at
-- base_url=cli-chat-proxy.grok.com
+支持两种换 token 流程：
+- PKCE / Authorization Code（referrer=grok-build）— Sub2API 默认，缓解 chat 403
+- Device Authorization Flow（无 referrer）— CPA / 健康号路径
+
+CPA headers 使用 grok-shell + x-compaction-at；base_url=cli-chat-proxy.grok.com
 
 用法:
   # 单个 / 批量 SSO，写出多个独立 auth 文件（每个可直接 cp 到 ~/.grok/auth.json）
@@ -44,26 +45,32 @@ from curl_cffi import requests
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
 AUTH_KEY = f"{OIDC_ISSUER}::{CLIENT_ID}"
-# 健康号 / grok-register-new scope（不含 conversations:*，不注入 referrer）
+# 不含 conversations:*（不重开 NSFW）；PKCE 靠 referrer=grok-build 过 Sub2 chat
 SCOPES = "openid profile email offline_access grok-cli:access api:access"
 
 # --- Device Authorization Flow 常量 ------------------------------------------
 DISCOVERY_URL = f"{OIDC_ISSUER}/.well-known/openid-configuration"
 DEVICE_VERIFY_URL = f"{OIDC_ISSUER}/oauth2/device/verify"
 DEVICE_APPROVE_URL = f"{OIDC_ISSUER}/oauth2/device/approve"
-# 兼容旧调用方；Device Flow 不再使用 redirect / referrer / plan
+
+# --- Authorization Code + PKCE 常量（Sub2API）--------------------------------
+# authorize 必须注入 referrer=grok-build，否则 access_token 无该 claim，
+# cli-chat-proxy 常 403 "chat endpoint is denied"。
 REDIRECT_URI = "http://127.0.0.1:56121/callback"
-GROK_REFERRER = ""  # 已弃用：健康号 JWT 无 referrer claim
-GROK_PLAN = ""
+GROK_REFERRER = "grok-build"
+GROK_PLAN = "generic"
 GROK_VERSION = "0.2.93"
 GROK_TOKEN_UA = f"grok-shell/{GROK_VERSION} (linux; x86_64)"
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
-# 旧授权码 consent 路径遗留（仅作兼容，默认不再走）
-NEXT_ACTION_ID = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
+# consent 提交用的 Next.js Server Action ID（快速路径；失效时再从 consent 页 JS 动态解析）
+NEXT_ACTION_ID = "40b1f238edcd2299db9b5d17c8777cfbab7cc3d889"
 _working_next_action_id = NEXT_ACTION_ID
+_LEGACY_NEXT_ACTION_IDS = (
+    "401b73e22a5e68737d0037e1aa449fef82cd1b35fb",
+)
 _NEXT_ACTION_RE = re.compile(
     r'(?:\$ACTION_ID_|next-action["\']?\s*[:=]\s*["\']|["\'])([0-9a-f]{40,44})["\']',
     re.I,
@@ -354,6 +361,7 @@ def _discover_action_ids_from_js(
 
     fetched = 0
     max_fetch = 40
+    allow_near: list[str] = []  # 靠近 "allow" 字样的 createServerReference，最高优先
     for score, src in scored:
         if should_stop and should_stop():
             break
@@ -366,12 +374,21 @@ def _discover_action_ids_from_js(
         except Exception:
             continue
         fetched += 1
-        prefer = score > 0 or ("consent" in text.lower() and "oauth" in text.lower())
+        low_text = text.lower()
+        prefer = score > 0 or ("consent" in low_text and "oauth" in low_text)
         # 含 allow + createServerReference 的 chunk 更优先
         if "createServerReference" in text or "callServer" in text:
             prefer = True
         for m in _CREATE_SERVER_REF_RE.finditer(text):
-            _add(m.group(1), prefer=prefer)
+            aid = m.group(1)
+            window = text[max(0, m.start() - 80) : m.end() + 120]
+            if re.search(r'allow|action["\']?\s*:\s*["\']allow', window, re.I):
+                _add(aid, prefer=True)
+                v = aid.strip().lower()
+                if v and v not in allow_near:
+                    allow_near.append(v)
+            else:
+                _add(aid, prefer=prefer)
         for m in _CALL_SERVER_RE.finditer(text):
             _add(m.group(1), prefer=prefer)
 
@@ -379,7 +396,18 @@ def _discover_action_ids_from_js(
     for aid in _extract_next_action_ids(html):
         _add(aid, prefer=False)
 
-    ordered = priority + [x for x in found if x not in priority]
+    # 过期内置 ID 沉底，避免快速路径反复 404
+    legacy = {x.lower() for x in _LEGACY_NEXT_ACTION_IDS}
+    ordered: list[str] = []
+    for group in (allow_near, priority, found):
+        for aid in group:
+            if aid in ordered:
+                continue
+            ordered.append(aid)
+    ordered = [x for x in ordered if x not in legacy] + [x for x in ordered if x in legacy]
+    current = str(NEXT_ACTION_ID or "").strip().lower()
+    if current and current not in legacy:
+        ordered = [current] + [x for x in ordered if x != current]
     if log:
         log(f"  [*] 从 JS chunks 解析 Next-Action {len(ordered)} 个（扫 {fetched} 个脚本）")
     return ordered
@@ -417,19 +445,8 @@ def _discover_device_endpoints(session, log=print) -> tuple[str, str] | None:
     return device_ep, token_ep
 
 
-def sso_to_token(
-    sso_cookie: str,
-    proxy: str = "",
-    log=print,
-    should_stop=None,
-) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in)。
-
-    使用 Device Authorization Flow（对齐 grok-register-new / 健康号）：
-    - scope 不含 conversations:*
-    - 不注入 referrer / plan
-    - 纯 HTTP：device verify + approve + poll token
-    """
+def _sso_session(sso_cookie: str, proxy: str = "", log=print, should_stop=None):
+    """建立带 SSO cookie 的 session；失败返回 (None, cancelled_fn)。"""
     stop_logged = False
 
     def _cancelled() -> bool:
@@ -441,7 +458,7 @@ def sso_to_token(
         return stopped
 
     if _cancelled():
-        return None
+        return None, _cancelled
 
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session()
@@ -455,13 +472,26 @@ def sso_to_token(
         r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15)
     except Exception as e:
         log(f"  ❌ 网络错误: {e}")
-        return None
+        return None, _cancelled
     if _cancelled():
-        return None
+        return None, _cancelled
     if "sign-in" in r.url or "sign-up" in r.url:
         log("  ❌ sso 无效")
-        return None
+        return None, _cancelled
     log("  ✅ sso 有效")
+    return s, _cancelled
+
+
+def _sso_to_token_device(
+    sso_cookie: str,
+    proxy: str = "",
+    log=print,
+    should_stop=None,
+) -> dict | None:
+    """Device Authorization Flow（无 referrer / plan）— CPA / 健康号。"""
+    s, _cancelled = _sso_session(sso_cookie, proxy=proxy, log=log, should_stop=should_stop)
+    if s is None:
+        return None
 
     endpoints = _discover_device_endpoints(s, log=log)
     if not endpoints:
@@ -518,7 +548,6 @@ def sso_to_token(
         verification_complete = f"{base}{sep}user_code={urllib.parse.quote(user_code)}"
     log(f"  [*] user_code={user_code} interval={interval}s")
 
-    # confirm: verify + approve（纯 HTTP，SSO cookie）
     cookie_hdr = f"sso={sso_cookie}"
     verify_headers = {
         "User-Agent": BROWSER_UA,
@@ -602,7 +631,6 @@ def sso_to_token(
             return None
     log("  ✅ 设备已授权")
 
-    # poll token
     deadline = time.time() + max(expires_in, 60)
     poll_interval = interval
     last_err = ""
@@ -667,6 +695,266 @@ def sso_to_token(
 
     log(f"  ❌ token poll 超时: {last_err}")
     return None
+
+
+def _sso_to_token_pkce(
+    sso_cookie: str,
+    proxy: str = "",
+    log=print,
+    should_stop=None,
+) -> dict | None:
+    """Authorization Code + PKCE（referrer=grok-build）— Sub2API 友好。"""
+    global _working_next_action_id
+
+    s, _cancelled = _sso_session(sso_cookie, proxy=proxy, log=log, should_stop=should_stop)
+    if s is None:
+        return None
+
+    verifier, challenge, state, nonce = _gen_pkce()
+
+    log(f"  🔑 Authorization Code Flow (referrer={GROK_REFERRER}, plan={GROK_PLAN})...")
+    authorize_params = urllib.parse.urlencode({
+        "client_id": CLIENT_ID,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "nonce": nonce,
+        "plan": GROK_PLAN,
+        "redirect_uri": REDIRECT_URI,
+        "referrer": GROK_REFERRER,
+        "response_type": "code",
+        "scope": SCOPES,
+        "state": state,
+    })
+    authorize_url = f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}"
+
+    def _open_consent(discover_actions=False):
+        if _cancelled():
+            return None, "", []
+        try:
+            resp = s.get(
+                authorize_url,
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=True,
+            )
+        except Exception as e:
+            log(f"  ❌ authorize 异常: {e}")
+            return None, "", []
+        url = str(resp.url)
+        if "sign-in" in url or "sign-up" in url:
+            log("  ❌ sso 无效")
+            return None, url, []
+        if "/oauth2/consent" not in url:
+            log(f"  ❌ authorize 未进入 consent: {url}")
+            return None, url, []
+        html = str(resp.text or "")
+        base = "https://accounts.x.ai"
+        if "auth.x.ai" in url and "accounts.x.ai" not in url:
+            base = "https://auth.x.ai"
+        if discover_actions:
+            action_ids = _discover_action_ids_from_js(
+                s,
+                html,
+                base_url=base,
+                log=log,
+                should_stop=should_stop,
+            )
+        else:
+            action_ids = []
+            cached = str(_working_next_action_id or "").strip().lower()
+            if cached:
+                action_ids.append(cached)
+            for action_id in _extract_next_action_ids(html):
+                if action_id not in action_ids:
+                    action_ids.append(action_id)
+            log(f"  [*] consent 快速路径 Next-Action {len(action_ids)} 个（跳过 JS chunks 扫描）")
+        return resp, url, action_ids
+
+    r, final_url, action_ids = _open_consent()
+    if r is None:
+        return None
+    if not action_ids:
+        action_ids = [NEXT_ACTION_ID]
+        log(f"  ⚠️ 未解析到 Next-Action，使用 fallback {NEXT_ACTION_ID[:12]}...")
+    else:
+        log(f"  [*] consent Next-Action 候选 {len(action_ids)} 个（首个 {action_ids[0][:12]}...）")
+
+    consent_payload = json.dumps([{
+        "action": "allow",
+        "clientId": CLIENT_ID,
+        "redirectUri": REDIRECT_URI,
+        "scope": SCOPES,
+        "state": state,
+        "codeChallenge": challenge,
+        "codeChallengeMethod": "S256",
+        "nonce": nonce,
+        "principalType": "User",
+        "principalId": "",
+        "referrer": GROK_REFERRER,
+    }])
+
+    code = None
+    last_err = ""
+    tried: set[str] = set()
+    for round_i in range(2):
+        if _cancelled():
+            return None
+        if round_i > 0:
+            log("  [*] consent 失败，重新进入 authorize/consent 并解析 Next-Action...")
+            r, final_url, action_ids = _open_consent(discover_actions=True)
+            if r is None:
+                return None
+            if not action_ids:
+                action_ids = [NEXT_ACTION_ID]
+
+        for action_id in action_ids[:8]:
+            if _cancelled():
+                return None
+            if action_id in tried:
+                continue
+            tried.add(action_id)
+            try:
+                r = s.post(
+                    final_url,
+                    data=consent_payload,
+                    headers={
+                        "Content-Type": "text/plain;charset=UTF-8",
+                        "Accept": "text/x-component",
+                        "Origin": "https://accounts.x.ai",
+                        "Referer": final_url,
+                        "Next-Action": action_id,
+                    },
+                    impersonate="chrome",
+                    timeout=15,
+                    allow_redirects=True,
+                )
+            except Exception as e:
+                last_err = f"consent 异常: {e}"
+                log(f"  ❌ {last_err}")
+                continue
+            body = str(r.text or "")
+            if r.status_code == 404 or "server action not found" in body.lower():
+                last_err = f"consent HTTP {r.status_code}: {body[:160]}"
+                log(f"  ⚠️ Next-Action {action_id[:12]}... 无效: {last_err}")
+                if str(_working_next_action_id or "").strip().lower() == action_id:
+                    _working_next_action_id = ""
+                continue
+            if r.status_code < 200 or r.status_code >= 300:
+                last_err = f"consent HTTP {r.status_code}: {body[:200]}"
+                log(f"  ⚠️ {last_err}")
+                continue
+            code = _parse_consent_code(body)
+            if code:
+                _working_next_action_id = action_id
+                log(f"  [*] Next-Action {action_id[:12]}... 返回 authorization code")
+                break
+            last_err = f"consent 未返回 code: {body[:180]}"
+            log(f"  ⚠️ Next-Action {action_id[:12]}... 非 allow 响应，继续试")
+        if code:
+            break
+
+    if not code:
+        log(f"  ❌ consent 失败（已试 {len(tried)} 个 Next-Action）: {last_err}")
+        return None
+    log("  ✅ 授权确认")
+
+    if _cancelled():
+        return None
+
+    token_data = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID,
+        "code_verifier": verifier,
+    })
+    try:
+        r = s.post(
+            f"{OIDC_ISSUER}/oauth2/token",
+            data=token_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": GROK_TOKEN_UA,
+                "X-Grok-Client-Version": GROK_VERSION,
+                "Accept": "*/*",
+            },
+            impersonate="chrome",
+            timeout=15,
+        )
+    except Exception as e:
+        log(f"  ❌ token 异常: {e}")
+        return None
+    if _cancelled():
+        return None
+    if r.status_code < 200 or r.status_code >= 300:
+        log(f"  ❌ token HTTP {r.status_code}: {str(r.text)[:200]}")
+        return None
+    try:
+        token = r.json()
+    except Exception:
+        log(f"  ❌ token 返回非 JSON: {str(r.text)[:200]}")
+        return None
+    if not token.get("access_token"):
+        log(f"  ❌ token 缺少 access_token: {token}")
+        return None
+    if not token.get("expires_in"):
+        token["expires_in"] = 21600
+    if not token.get("token_type"):
+        token["token_type"] = "Bearer"
+
+    ap = decode_jwt_payload(token["access_token"])
+    ref = ap.get("referrer")
+    if ref not in (GROK_REFERRER, "grok-build", "cli-proxy-api"):
+        log(f"  ⚠️ access_token referrer={ref!r}（预期 {GROK_REFERRER!r} 或 grok-build）")
+    else:
+        log(f"  ✅ access_token referrer={ref!r}")
+    log(
+        f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+        + (" + refresh_token" if token.get("refresh_token") else "")
+    )
+    return token
+
+
+def sso_to_token(
+    sso_cookie: str,
+    proxy: str = "",
+    log=print,
+    should_stop=None,
+    flow: str = "pkce",
+) -> dict | None:
+    """SSO cookie → token dict (access/refresh/expires_in)。
+
+    flow:
+      - "pkce": Authorization Code + PKCE，注入 referrer=grok-build（Sub2API 默认）
+      - "device": Device Authorization Flow，无 referrer（CPA / 健康号）
+      - "auto": 先 PKCE，失败再 Device
+    """
+    mode = str(flow or "pkce").strip().lower()
+    if mode not in ("pkce", "device", "auto"):
+        log(f"  ⚠️ 未知 flow={flow!r}，回退 pkce")
+        mode = "pkce"
+
+    if mode == "device":
+        return _sso_to_token_device(
+            sso_cookie, proxy=proxy, log=log, should_stop=should_stop
+        )
+    if mode == "pkce":
+        return _sso_to_token_pkce(
+            sso_cookie, proxy=proxy, log=log, should_stop=should_stop
+        )
+
+    token = _sso_to_token_pkce(
+        sso_cookie, proxy=proxy, log=log, should_stop=should_stop
+    )
+    if token:
+        return token
+    if should_stop and should_stop():
+        return None
+    log("  [*] PKCE 失败，回退 Device Flow...")
+    return _sso_to_token_device(
+        sso_cookie, proxy=proxy, log=log, should_stop=should_stop
+    )
+
 
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
@@ -1671,6 +1959,7 @@ def convert_sso_entries(
                 proxy=proxy,
                 log=worker_log,
                 should_stop=should_stop,
+                flow="device",
             )
             if not token:
                 with lock:
