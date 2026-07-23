@@ -2,3 +2,4 @@ DrissionPage==4.1.1.4
 curl_cffi==0.13.0
 requests==2.32.5
 psutil>=5.9.0
+playwright>=1.40.0
