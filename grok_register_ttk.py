@@ -42,7 +42,29 @@ from email_providers.common import pick_list_payload as _pick_list
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+OUTPUT_ROOT = os.path.join(APP_DIR, "output")
+RUNS_ROOT = os.path.join(OUTPUT_ROOT, "runs")
+FAILED_SSO_ROOT = os.path.join(OUTPUT_ROOT, "failed_sso")
+LEGACY_OUTPUT_ROOT = os.path.join(OUTPUT_ROOT, "legacy")
+MAIL_OUTPUT_ROOT = os.path.join(OUTPUT_ROOT, "mail")
+CPA_OUTPUT_ROOT = os.path.join(OUTPUT_ROOT, "cpa")
+SUB2API_OUTPUT_ROOT = os.path.join(OUTPUT_ROOT, "sub2api")
+MAIL_CREDENTIALS_FILE = os.path.join(MAIL_OUTPUT_ROOT, "mail_credentials.txt")
 MEMORY_CLEANUP_INTERVAL = 5
+
+# 当前注册批次的落盘路径（按时间戳分目录）
+_run_output = {
+    "stamp": "",
+    "run_dir": "",
+    "sso_dir": "",
+    "verified_dir": "",
+    "accounts_file": "",
+    "sso_file": "",
+    "verified_file": "",
+    "verified_accounts_file": "",
+    "failed_file": "",
+}
+_run_output_lock = threading.Lock()
 
 UI_BG = "#242424"
 UI_PANEL_BG = "#2b2b2b"
@@ -68,14 +90,21 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
+    # 开启后创建 user@随机子域.主域（需 Worker RANDOM_SUBDOMAIN_DOMAINS 包含该主域）
+    "cloudflare_random_subdomain": False,
     "proxy": "http://127.0.0.1:7890",
+    # 代理池：文件每行一条；优先于单条 proxy 做轮换。空池则回退单条 proxy / 直连。
+    "proxy_pool_file": "",
+    "proxy_pool": [],
+    "proxy_accounts_per_ip": 1,
+    "proxy_rotate_on_fail": True,
     "enable_nsfw": True,
     "register_count": 1,
     "register_workers": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后自动走授权码流程换 token 并写成 CPA 扁平格式
-    "cpa_auto_add": False,
-    "cpa_auth_dir": "",
+    "cpa_auto_add": True,
+    "cpa_auth_dir": os.path.join(APP_DIR, "output", "cpa"),
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
@@ -85,7 +114,7 @@ DEFAULT_CONFIG = {
     "yyds_default_domain": "",
     # Sub2API：注册成功后按批次写出导入包 / 可选远程创建账号
     "sub2api_auto_add": False,
-    "sub2api_dir": "",
+    "sub2api_dir": os.path.join(APP_DIR, "output", "sub2api"),
     "sub2api_url": "",
     "sub2api_token": "",
     "sub2api_batch_size": 20,
@@ -247,12 +276,121 @@ EXTENSION_PATH = os.path.abspath(
 
 DUCKMAIL_API_BASE_DEFAULT = duckmail_provider.API_BASE_DEFAULT
 
+# 浏览器会话 / 当前账号出口代理（按线程隔离，支持并发 worker）
+_tls = threading.local()
+
 
 def get_proxies():
-    proxy = config.get("proxy", "")
+    proxy = resolve_active_proxy()
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def resolve_active_proxy() -> str:
+    """当前线程绑定的代理 > 全局 config.proxy。"""
+    bound = str(getattr(_tls, "proxy", "") or "").strip()
+    if bound:
+        return bound
+    return str(config.get("proxy", "") or "").strip()
+
+
+def set_thread_proxy(proxy: str = "") -> str:
+    url = str(proxy or "").strip()
+    _tls.proxy = url
+    return url
+
+
+_proxy_rotator = None
+_proxy_rotator_lock = threading.Lock()
+
+
+def reset_proxy_rotator():
+    global _proxy_rotator
+    with _proxy_rotator_lock:
+        _proxy_rotator = None
+
+
+def get_proxy_rotator():
+    """按当前 config 懒加载代理池；无池时返回 None。"""
+    global _proxy_rotator
+    from proxy_pool import ProxyRotator, load_proxy_list
+
+    with _proxy_rotator_lock:
+        if _proxy_rotator is not None:
+            return _proxy_rotator
+        urls = load_proxy_list(
+            pool=config.get("proxy_pool"),
+            pool_file=str(config.get("proxy_pool_file") or ""),
+            single="",  # 单条 proxy 仅作无池时的粘性回退，不进轮换池
+        )
+        if not urls:
+            return None
+        _proxy_rotator = ProxyRotator(
+            urls,
+            accounts_per_ip=int(config.get("proxy_accounts_per_ip", 1) or 1),
+            rotate_on_fail=bool(config.get("proxy_rotate_on_fail", True)),
+        )
+        return _proxy_rotator
+
+
+def bind_proxy_for_account(log_callback=None, force_new: bool = False) -> str:
+    """为下一个账号绑定出口；有代理池则轮换，否则用单条 proxy。"""
+    from proxy_pool import mask_proxy_url
+
+    rotator = get_proxy_rotator()
+    current = resolve_active_proxy()
+    if rotator is None:
+        proxy = str(config.get("proxy", "") or "").strip()
+        set_thread_proxy(proxy)
+        if log_callback:
+            log_callback(f"[*] 出口代理: {mask_proxy_url(proxy)}")
+        return proxy
+
+    if force_new:
+        current = ""
+    proxy = rotator.acquire(current=current) or ""
+    if not proxy:
+        set_thread_proxy("")
+        if log_callback:
+            log_callback("[!] 代理池已耗尽（均达上限或已退役），回退直连")
+        return ""
+    prev = str(getattr(_tls, "proxy", "") or "").strip()
+    set_thread_proxy(proxy)
+    if log_callback:
+        log_callback(
+            f"[*] 出口代理: {mask_proxy_url(proxy)} | {rotator.summary()}"
+        )
+    return proxy
+
+
+def note_proxy_account_success(log_callback=None) -> bool:
+    """当前出口记一次成功；若需轮换返回 True。"""
+    from proxy_pool import mask_proxy_url
+
+    rotator = get_proxy_rotator()
+    proxy = resolve_active_proxy()
+    if rotator is None or not proxy:
+        return False
+    should_rotate = rotator.record_success(proxy)
+    if should_rotate and log_callback:
+        log_callback(
+            f"[*] 代理 {mask_proxy_url(proxy)} 已达 "
+            f"{config.get('proxy_accounts_per_ip', 1)} 个成功号，下次将换 IP"
+        )
+    return should_rotate
+
+
+def note_proxy_account_fail(log_callback=None) -> None:
+    from proxy_pool import mask_proxy_url
+
+    rotator = get_proxy_rotator()
+    proxy = resolve_active_proxy()
+    if rotator is None or not proxy:
+        return
+    rotator.record_fail(proxy)
+    if log_callback:
+        log_callback(f"[*] 代理 {mask_proxy_url(proxy)} 已标记退役（失败轮换）")
 
 
 def get_duckmail_api_base():
@@ -319,6 +457,10 @@ def _pick_list_payload(data):
     return _pick_list(data)
 
 
+def cloudflare_random_subdomain_enabled():
+    return bool(config.get("cloudflare_random_subdomain", False))
+
+
 def cloudflare_create_temp_address(api_base):
     return cloudflare_provider.create_temp_address(
         http_post,
@@ -329,6 +471,7 @@ def cloudflare_create_temp_address(api_base):
         auth_mode=get_cloudflare_auth_mode(),
         custom_auth=get_cloudflare_custom_auth(),
         name=generate_username(10),
+        enable_random_subdomain=cloudflare_random_subdomain_enabled(),
     )
 
 
@@ -385,8 +528,8 @@ def _normalize_sso_token(raw_token):
 
 
 def _resolve_cpa_proxy():
-    """CPA 换 token 用的代理：优先 config.proxy，其次环境变量，最后本机 7890。"""
-    proxy = str(config.get("proxy", "") or "").strip()
+    """CPA 换 token 用的代理：优先线程绑定 / config.proxy，其次环境变量，最后本机 7890。"""
+    proxy = resolve_active_proxy()
     if proxy:
         return proxy
     for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
@@ -466,18 +609,221 @@ def wait_sub2api_pending(log_callback=None):
         executor.shutdown(wait=True, cancel_futures=False)
 
 
-def _append_sso_pending(email: str, sso: str, log_callback=None):
-    """CPA 失败时保留 SSO，便于事后补转。"""
+def ensure_output_dirs():
+    """创建统一输出目录结构。"""
+    for path in (
+        OUTPUT_ROOT,
+        RUNS_ROOT,
+        FAILED_SSO_ROOT,
+        LEGACY_OUTPUT_ROOT,
+        MAIL_OUTPUT_ROOT,
+        CPA_OUTPUT_ROOT,
+        SUB2API_OUTPUT_ROOT,
+    ):
+        os.makedirs(path, exist_ok=True)
+
+
+def migrate_legacy_root_outputs(log_callback=None):
+    """把根目录散落的 accounts/sso 文本挪到 output/legacy，避免继续堆积。"""
+    ensure_output_dirs()
+    patterns = (
+        "accounts_*.txt",
+        "sso_for_sub2api_*.txt",
+        "sso_pending.txt",
+    )
+    moved = 0
+    import glob as _glob
+
+    for pattern in patterns:
+        for path in _glob.glob(os.path.join(APP_DIR, pattern)):
+            if not os.path.isfile(path):
+                continue
+            name = os.path.basename(path)
+            dest = os.path.join(LEGACY_OUTPUT_ROOT, name)
+            if os.path.exists(dest):
+                stem, ext = os.path.splitext(name)
+                dest = os.path.join(
+                    LEGACY_OUTPUT_ROOT,
+                    f"{stem}_{datetime.datetime.now().strftime('%H%M%S')}{ext}",
+                )
+            try:
+                os.replace(path, dest)
+                moved += 1
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[!] 整理旧文件失败 {name}: {exc}")
+    if moved and log_callback:
+        log_callback(f"[*] 已整理 {moved} 个旧账号/SSO 文件 → {LEGACY_OUTPUT_ROOT}")
+    return moved
+
+
+def begin_run_output(stamp: str | None = None, log_callback=None) -> dict:
+    """为本轮注册创建分目录输出：
+
+    output/runs/<时间>/
+      sso/        ← 原始 SSO（与 token 分开）
+      verified/   ← 验活成功的 token
+    output/failed_sso/<时间>/
+      failed_sso.txt
+    """
+    ensure_output_dirs()
+    migrate_legacy_root_outputs(log_callback=log_callback)
+    stamp = (stamp or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")).strip()
+    run_dir = os.path.join(RUNS_ROOT, stamp)
+    sso_dir = os.path.join(run_dir, "sso")
+    verified_dir = os.path.join(run_dir, "verified")
+    failed_dir = os.path.join(FAILED_SSO_ROOT, stamp)
+    for path in (run_dir, sso_dir, verified_dir, failed_dir):
+        os.makedirs(path, exist_ok=True)
+    info = {
+        "stamp": stamp,
+        "run_dir": run_dir,
+        "sso_dir": sso_dir,
+        "verified_dir": verified_dir,
+        "accounts_file": os.path.join(sso_dir, "accounts.txt"),
+        "sso_file": os.path.join(sso_dir, "sso_for_sub2api.txt"),
+        "verified_file": os.path.join(verified_dir, "verified_tokens.jsonl"),
+        "verified_accounts_file": os.path.join(verified_dir, "accounts_ok.txt"),
+        "failed_file": os.path.join(failed_dir, "failed_sso.txt"),
+    }
+    with _run_output_lock:
+        _run_output.update(info)
+    if log_callback:
+        log_callback(f"[*] 本轮 SSO 目录: {sso_dir}")
+        log_callback(f"[*] 本轮验活成功 token 目录: {verified_dir}")
+        log_callback(f"[*] 失败 SSO 目录: {failed_dir}")
+    return dict(info)
+
+
+def _append_text_line(path: str, line: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line if line.endswith("\n") else line + "\n")
+
+
+def persist_obtained_sso(
+    email: str,
+    password: str,
+    sso: str,
+    *,
+    accounts_file: str = "",
+    log_callback=None,
+) -> dict:
+    """拿到 SSO 后立刻写入 runs/<stamp>/sso/（不含验活 token）。"""
+    sso = _normalize_sso_token(sso)
+    if not sso:
+        return {}
+    with _run_output_lock:
+        info = dict(_run_output)
+    accounts_path = (accounts_file or info.get("accounts_file") or "").strip()
+    sso_path = str(info.get("sso_file") or "").strip()
+    if not accounts_path:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        info = begin_run_output(stamp=stamp, log_callback=log_callback)
+        accounts_path = info["accounts_file"]
+        sso_path = info["sso_file"]
+    line = f"{email}----{password or ''}----{sso}\n"
     try:
-        path = os.path.join(APP_DIR, "sso_pending.txt")
-        line = f"{email}----{sso}\n" if email else f"{sso}\n"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
+        with _run_output_lock:
+            _append_text_line(accounts_path, line)
+            if sso_path:
+                _append_text_line(sso_path, f"{sso}\n")
         if log_callback:
-            log_callback(f"[CPA] 已追加待重转 SSO → {path}")
+            log_callback(f"[*] 已保存原始 SSO → {accounts_path}")
     except Exception as exc:
         if log_callback:
-            log_callback(f"[CPA] 写入 sso_pending 失败: {exc}")
+            log_callback(f"[!] 保存 SSO 失败: {exc}")
+    return {"accounts_file": accounts_path, "sso_file": sso_path}
+
+
+def persist_verified_token(
+    email: str,
+    password: str,
+    sso: str,
+    creds: dict | None,
+    log_callback=None,
+) -> dict:
+    """验活成功后写入 runs/<stamp>/verified/，与 SSO 目录分离。"""
+    with _run_output_lock:
+        info = dict(_run_output)
+    verified_file = str(info.get("verified_file") or "").strip()
+    verified_accounts = str(info.get("verified_accounts_file") or "").strip()
+    if not verified_file:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        info = begin_run_output(stamp=stamp, log_callback=log_callback)
+        verified_file = info["verified_file"]
+        verified_accounts = info["verified_accounts_file"]
+
+    access = str((creds or {}).get("access_token") or "").strip()
+    refresh = str((creds or {}).get("refresh_token") or "").strip()
+    # accounts_ok：邮箱----密码----access_token（故意不含 SSO）
+    account_line = f"{email}----{password or ''}----{access}\n"
+    record = {
+        "email": email or "",
+        "password": password or "",
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": str((creds or {}).get("expires_at") or ""),
+        "base_url": str((creds or {}).get("base_url") or ""),
+        # SSO 仅作溯源字段，不写入 sso/ 混目录
+        "sso": _normalize_sso_token(sso),
+    }
+    try:
+        with _run_output_lock:
+            _append_text_line(verified_accounts, account_line)
+            _append_text_line(
+                verified_file, json.dumps(record, ensure_ascii=False) + "\n"
+            )
+        if log_callback:
+            log_callback(f"[+] 验活成功 token 已写入 → {info.get('verified_dir') or verified_file}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 写入验活成功 token 失败: {exc}")
+    return {"verified_file": verified_file, "verified_accounts_file": verified_accounts}
+
+
+def persist_failed_sso(
+    email: str,
+    password: str,
+    sso: str,
+    reason: str = "",
+    log_callback=None,
+) -> str:
+    """换 token / 验活失败时写入 output/failed_sso/<stamp>/failed_sso.txt。"""
+    sso = _normalize_sso_token(sso)
+    if not sso:
+        return ""
+    with _run_output_lock:
+        failed_path = str(_run_output.get("failed_file") or "").strip()
+    if not failed_path:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        info = begin_run_output(stamp=stamp, log_callback=log_callback)
+        failed_path = info["failed_file"]
+    note = (reason or "").replace("\n", " ").strip()
+    line = f"{email}----{password or ''}----{sso}"
+    if note:
+        line = f"{line}----{note}"
+    try:
+        with _run_output_lock:
+            _append_text_line(failed_path, line + "\n")
+        if log_callback:
+            log_callback(f"[!] 换 token/验活失败，SSO 已写入: {failed_path}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 写入失败 SSO 目录失败: {exc}")
+        return ""
+    return failed_path
+
+
+def _append_sso_pending(email: str, sso: str, log_callback=None):
+    """CPA 失败时保留 SSO，写入本轮 failed_sso 目录（兼容旧调用）。"""
+    path = persist_failed_sso(email, "", sso, reason="cpa_pending", log_callback=None)
+    if log_callback and path:
+        log_callback(f"[CPA] 已追加待重转 SSO → {path}")
+    elif log_callback and not path:
+        log_callback("[CPA] 写入待重转 SSO 失败")
 
 
 def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
@@ -579,11 +925,11 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
         return False
 
 
-def add_sso_to_sub2api(raw_token, email="", log_callback=None, should_stop=None):
+def add_sso_to_sub2api(raw_token, email="", password="", log_callback=None, should_stop=None):
     """SSO → 换 token → 验活 →（可选）写导入包 / 远程创建。
 
-    返回 Future[bool]：仅当换 token 成功，且（未开验活或验活通过）时为 True。
-    注册主流程应 future.result() 后再计入成功；仅拿到 SSO 不算成功。
+    返回 Future[bool]：换 token 成功且（未开验活或验活通过）即为 True。
+    本地写包 / 远程创建失败只告警，不再把「验活已通过」的账号打成失败。
     """
     global _sub2api_batch_writer, _sub2api_executor
     from concurrent.futures import Future
@@ -598,22 +944,24 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None, should_stop=None)
         return _done(False)
 
     export_enabled = bool(config.get("sub2api_auto_add", False))
-    out_dir = str(config.get("sub2api_dir", "") or "").strip() if export_enabled else ""
-    remote_url = str(config.get("sub2api_url", "") or "").strip() if export_enabled else ""
+    if not export_enabled:
+        # 关开关 = 只出本地 SSO，不在本地换 token / 验活 / 推远程
+        if log_callback:
+            log_callback("[*] 已关闭 SSO→Sub2API，仅保存本地 SSO")
+        return _done(True)
+
+    out_dir = str(config.get("sub2api_dir", "") or "").strip()
+    remote_url = str(config.get("sub2api_url", "") or "").strip()
     admin_token = str(config.get("sub2api_token", "") or "").strip()
-    if export_enabled:
-        if not out_dir and not remote_url:
-            if log_callback:
-                log_callback(
-                    "[Debug] 已开启 Sub2API 直出但未配置 sub2api_dir 或 sub2api_url，仅验活不计导出"
-                )
-        if remote_url and not admin_token:
-            if log_callback:
-                log_callback("[Debug] 已配置 sub2api_url 但未配置 sub2api_token，跳过远程创建")
-            remote_url = ""
-        if not out_dir and not remote_url:
-            # 仍做换 token + 验活，作为成功门槛
-            pass
+    if not out_dir and not remote_url:
+        if log_callback:
+            log_callback(
+                "[Debug] 已开启 Sub2API 直出但未配置 sub2api_dir 或 sub2api_url，仅验活不计导出"
+            )
+    if remote_url and not admin_token:
+        if log_callback:
+            log_callback("[Debug] 已配置 sub2api_url 但未配置 sub2api_token，跳过远程创建")
+        remote_url = ""
 
     proxy = str(config.get("proxy", "") or "").strip()
     # 默认验活；关闭后改为「换 token 成功」即算通过
@@ -628,24 +976,25 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None, should_stop=None)
                 text = text.encode("gbk", errors="replace").decode("gbk")
             log_callback(f"[Sub2API] {text}")
 
-    if export_enabled and out_dir and (
+    if out_dir and (
         _sub2api_executor is None
         or _sub2api_batch_writer is None
         or _sub2api_batch_writer.output_root.resolve() != _s2cpa.Path(out_dir).resolve()
     ):
         begin_sub2api_batch_session(log_callback=log_callback)
-    elif _sub2api_executor is None and (verify_enabled or export_enabled):
+    elif _sub2api_executor is None and (verify_enabled or out_dir or remote_url):
         begin_sub2api_batch_session(log_callback=log_callback)
 
     job = {
         "sso": sso,
         "email": email,
-        "proxy": proxy,
+        "password": password or "",
+        "proxy": resolve_active_proxy() or proxy,
         "out_dir": out_dir,
         "remote_url": remote_url,
         "admin_token": admin_token,
         "verify_enabled": verify_enabled,
-        "export_enabled": export_enabled and bool(out_dir or remote_url),
+        "export_enabled": bool(out_dir or remote_url),
     }
 
     def _worker(payload) -> bool:
@@ -673,39 +1022,55 @@ def add_sso_to_sub2api(raw_token, email="", log_callback=None, should_stop=None)
                     _s2_log(f"{label}: 验活失败 ({message})")
                     return False
                 _s2_log(f"{label}: 验活通过 ({message})")
+
+            # 验活（或换 token）已通过：单独落盘 token，不与 SSO 目录混写
+            persist_verified_token(
+                payload.get("email") or "",
+                payload.get("password") or "",
+                payload["sso"],
+                creds,
+                log_callback=log_callback,
+            )
+
+            # 写包 / 远程创建失败不影响「验活成功」计数
             if payload["export_enabled"]:
-                with _sub2api_io_lock:
-                    if payload["out_dir"]:
-                        writer = _sub2api_batch_writer
-                        if writer is None:
-                            raise RuntimeError("未能创建 Sub2API 批次写入器")
-                        result = writer.add_credentials(creds, name=payload["email"])
-                        _s2_log(
-                            f"{label}: 已写入第 {result['package_index']:03d} 包 "
-                            f"({result['position']}/{result['batch_size']}): {result['path']}"
-                        )
-                    if payload["remote_url"]:
-                        created = _s2cpa.upload_sub2api_account(
-                            payload["remote_url"],
-                            payload["admin_token"],
-                            creds,
-                            name=payload["email"],
-                        )
-                        created_id = ""
-                        if isinstance(created, dict):
-                            data = (
-                                created.get("data")
-                                if isinstance(created.get("data"), dict)
-                                else created
+                try:
+                    with _sub2api_io_lock:
+                        if payload["out_dir"]:
+                            writer = _sub2api_batch_writer
+                            if writer is None:
+                                raise RuntimeError("未能创建 Sub2API 批次写入器")
+                            result = writer.add_credentials(creds, name=payload["email"])
+                            _s2_log(
+                                f"{label}: 已写入第 {result['package_index']:03d} 包 "
+                                f"({result['position']}/{result['batch_size']}): {result['path']}"
                             )
-                            created_id = str((data or {}).get("id") or "")
-                        _s2_log(
-                            f"{label}: 已创建远程账号"
-                            f"{(' id=' + created_id) if created_id else ''}"
-                        )
+                        if payload["remote_url"]:
+                            created = _s2cpa.upload_sub2api_account(
+                                payload["remote_url"],
+                                payload["admin_token"],
+                                creds,
+                                name=payload["email"],
+                            )
+                            created_id = ""
+                            if isinstance(created, dict):
+                                data = (
+                                    created.get("data")
+                                    if isinstance(created.get("data"), dict)
+                                    else created
+                                )
+                                created_id = str((data or {}).get("id") or "")
+                            _s2_log(
+                                f"{label}: 已创建远程账号"
+                                f"{(' id=' + created_id) if created_id else ''}"
+                            )
+                except Exception as export_exc:
+                    _s2_log(
+                        f"{label}: 验活已通过，但导出/远程写入失败（仍计成功）: {export_exc}"
+                    )
             return True
         except Exception as exc:
-            _s2_log(f"{label}: 直出失败: {exc}")
+            _s2_log(f"{label}: 换 token/验活失败: {exc}")
             return False
 
     executor = _sub2api_executor
@@ -728,13 +1093,34 @@ def wait_sub2api_account_result(future, timeout=None) -> bool:
         return False
 
 
-def create_browser_options():
+def create_browser_options(proxy: str = ""):
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    # 默认最小化：不抢前台，避免挡住正常工作；Turnstile 仍需要有真实窗口。
+    options.set_argument("--start-minimized")
+    options.set_argument("--mute-audio")
+    proxy = str(proxy or "").strip()
+    if proxy:
+        # DrissionPage：浏览器走该 HTTP/SOCKS 代理（与换 token 同出口）
+        try:
+            options.set_proxy(proxy)
+        except Exception:
+            options.set_argument(f"--proxy-server={proxy}")
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
+
+
+def _minimize_browser_window(page_obj, log_callback=None):
+    """启动后强制最小化一次；失败不影响主流程。"""
+    if page_obj is None:
+        return
+    try:
+        page_obj.set.window.mini()
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 浏览器最小化失败（可忽略）: {exc}")
 
 
 def _build_request_kwargs(**kwargs):
@@ -1434,8 +1820,6 @@ def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=No
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
-_tls = threading.local()
-
 
 def _active_browser():
     return getattr(_tls, "browser", None)
@@ -1582,14 +1966,24 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
-def start_browser(log_callback=None):
+def start_browser(log_callback=None, proxy=None):
     last_exc = None
+    if proxy is None:
+        proxy = resolve_active_proxy()
+    else:
+        set_thread_proxy(proxy)
+        proxy = resolve_active_proxy()
+    from proxy_pool import mask_proxy_url
+
     for attempt in range(1, 5):
         try:
-            browser_obj = Chromium(create_browser_options())
+            browser_obj = Chromium(create_browser_options(proxy=proxy))
             tabs = browser_obj.get_tabs()
             page_obj = tabs[-1] if tabs else browser_obj.new_tab()
             _set_browser_session(browser_obj, page_obj)
+            _minimize_browser_window(page_obj, log_callback=log_callback)
+            if log_callback:
+                log_callback(f"[*] 浏览器代理: {mask_proxy_url(proxy)}")
             if log_callback and getattr(browser_obj, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser_obj.user_data_path}")
             if log_callback and attempt > 1:
@@ -1622,9 +2016,9 @@ def stop_browser():
         pass
 
 
-def restart_browser(log_callback=None):
+def restart_browser(log_callback=None, proxy=None):
     stop_browser()
-    return start_browser(log_callback=log_callback)
+    return start_browser(log_callback=log_callback, proxy=proxy)
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
@@ -3001,7 +3395,22 @@ class GrokRegisterGUI:
         self.proxy_entry = tk_entry(config_frame, textvariable=self.proxy_var, width=34)
         add_field(self.proxy_entry, 1, 3)
 
-        # 服务商专属配置（按选择显示）
+        add_label(2, 0, "代理池文件:")
+        self.proxy_pool_file_var = tk.StringVar(value=config.get("proxy_pool_file", ""))
+        self.proxy_pool_file_entry = tk_entry(
+            config_frame, textvariable=self.proxy_pool_file_var, width=34
+        )
+        add_field(self.proxy_pool_file_entry, 2, 1)
+        add_label(2, 2, "每IP成功数:")
+        self.proxy_per_ip_var = tk.StringVar(
+            value=str(config.get("proxy_accounts_per_ip", 1))
+        )
+        self.proxy_per_ip_entry = tk_entry(
+            config_frame, textvariable=self.proxy_per_ip_var, width=8
+        )
+        add_field(self.proxy_per_ip_entry, 2, 3, sticky=tk.W)
+
+        # 服务商专属配置（按选择显示）— 原 row=2，下移避免重叠
         self.provider_frame = tk.LabelFrame(
             config_frame,
             text="邮箱服务商配置",
@@ -3012,7 +3421,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.provider_frame.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
+        self.provider_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(6, 4))
         self.provider_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.provider_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -3071,6 +3480,9 @@ class GrokRegisterGUI:
         )
         self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
         self.cloudflare_custom_auth_var = tk.StringVar(value=str(config.get("cloudflare_custom_auth", "")))
+        self.cloudflare_random_subdomain_var = tk.BooleanVar(
+            value=bool(config.get("cloudflare_random_subdomain", False))
+        )
         self._cloudflare_widgets = [
             p_label(0, 0, "API Base:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_api_base_var, width=52), 0, 1, columnspan=3),
@@ -3094,6 +3506,17 @@ class GrokRegisterGUI:
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_custom_auth_var, width=34), 2, 3),
             p_label(3, 0, "CF 路径:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_paths_var, width=52), 3, 1, columnspan=3),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="随机三级域名（user@子域.主域，需 Worker 开启 RANDOM_SUBDOMAIN）",
+                    variable=self.cloudflare_random_subdomain_var,
+                ),
+                4,
+                0,
+                columnspan=4,
+                sticky=tk.W,
+            ),
         ]
 
         # YYDS
@@ -3163,7 +3586,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
         }
 
-        add_label(3, 0, "并发数:")
+        add_label(6, 0, "并发数:")
         self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
         self.workers_spinbox = tk.Spinbox(
             config_frame,
@@ -3179,7 +3602,7 @@ class GrokRegisterGUI:
             disabledforeground=UI_MUTED_FG,
             relief=tk.SOLID,
         )
-        add_field(self.workers_spinbox, 3, 1, sticky=tk.W)
+        add_field(self.workers_spinbox, 6, 1, sticky=tk.W)
 
         # SSO → CPA auth 可选
         self.cpa_frame = tk.LabelFrame(
@@ -3192,7 +3615,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.cpa_frame.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.cpa_frame.grid(row=7, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
         self.cpa_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.cpa_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -3236,7 +3659,7 @@ class GrokRegisterGUI:
             relief=tk.GROOVE,
             borderwidth=1,
         )
-        self.sub2api_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.sub2api_frame.grid(row=8, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
         self.sub2api_frame.grid_columnconfigure(1, weight=1, minsize=240)
         self.sub2api_frame.grid_columnconfigure(3, weight=1, minsize=240)
 
@@ -3455,6 +3878,14 @@ class GrokRegisterGUI:
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
         config["proxy"] = self.proxy_var.get().strip()
+        config["proxy_pool_file"] = self.proxy_pool_file_var.get().strip()
+        try:
+            config["proxy_accounts_per_ip"] = max(
+                1, int(self.proxy_per_ip_var.get().strip() or 1)
+            )
+        except Exception:
+            config["proxy_accounts_per_ip"] = 1
+        config["proxy_rotate_on_fail"] = True
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["duckmail_api_base"] = self.duckmail_api_base_var.get().strip() or DUCKMAIL_API_BASE_DEFAULT
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
@@ -3462,6 +3893,7 @@ class GrokRegisterGUI:
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
         config["defaultDomains"] = self.default_domains_var.get().strip()
         config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
+        config["cloudflare_random_subdomain"] = bool(self.cloudflare_random_subdomain_var.get())
         config["yyds_api_key"] = self.yyds_api_key_var.get().strip()
         config["yyds_jwt"] = self.yyds_jwt_var.get().strip()
         config["mailnest_api_key"] = self.mailnest_api_key_var.get().strip()
@@ -3533,9 +3965,9 @@ class GrokRegisterGUI:
         self.fail_stats = empty_fail_stats()
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
+        run_info = begin_run_output(stamp=now, log_callback=self.log)
+        self.accounts_output_file = run_info["accounts_file"]
+        self.failed_sso_file = run_info["failed_file"]
         self.update_stats()
         self._set_running_ui(True)
         self._stats_lock = threading.Lock()
@@ -3546,11 +3978,37 @@ class GrokRegisterGUI:
         self.log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
         self.log(f"[*] SSO→Sub2API: {'开' if config.get('sub2api_auto_add') else '关'}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+        self.log(f"[*] 换 token/验活失败 SSO → {self.failed_sso_file}")
         threading.Thread(
             target=self._run_registration_entry,
             args=(count, workers),
             daemon=True,
         ).start()
+
+    def _sync_export_config_from_ui(self):
+        """从界面同步 CPA / Sub2API 导出相关配置。"""
+        config["proxy"] = self.proxy_var.get().strip()
+        config["proxy_pool_file"] = self.proxy_pool_file_var.get().strip()
+        try:
+            config["proxy_accounts_per_ip"] = max(
+                1, int(self.proxy_per_ip_var.get().strip() or 1)
+            )
+        except Exception:
+            config["proxy_accounts_per_ip"] = 1
+        config["proxy_rotate_on_fail"] = True
+        config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
+        config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
+        config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
+        config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        config["sub2api_auto_add"] = bool(self.sub2api_auto_add_var.get())
+        config["sub2api_dir"] = self.sub2api_dir_var.get().strip()
+        config["sub2api_url"] = self.sub2api_url_var.get().strip()
+        config["sub2api_token"] = self.sub2api_token_var.get().strip()
+        try:
+            config["sub2api_batch_size"] = max(int(self.sub2api_batch_size_var.get()), 1)
+        except Exception:
+            config["sub2api_batch_size"] = 20
+        config["sub2api_verify"] = bool(self.sub2api_verify_var.get())
 
     def start_sso_recovery(self):
         if self.is_running:
@@ -3560,17 +4018,32 @@ class GrokRegisterGUI:
             self.log("[!] SSO 补转已经在运行")
             return
 
-        config["proxy"] = self.proxy_var.get().strip()
-        config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
-        config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
-        config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
-        if not config["cpa_auth_dir"] and not config["cpa_remote_url"]:
-            self.log("[!] 请先配置 CPA auth 目录或远程地址")
+        self._sync_export_config_from_ui()
+        cpa_dir = str(config.get("cpa_auth_dir", "") or "").strip()
+        cpa_remote = str(config.get("cpa_remote_url", "") or "").strip()
+        cpa_key = str(config.get("cpa_management_key", "") or "").strip()
+        sub2_dir = str(config.get("sub2api_dir", "") or "").strip()
+        sub2_url = str(config.get("sub2api_url", "") or "").strip()
+        sub2_token = str(config.get("sub2api_token", "") or "").strip()
+
+        cpa_ready = bool(cpa_dir or cpa_remote)
+        # 补转：只要填了 Sub2API 目录/远程即可，不强制要求勾选「注册后自动」
+        sub2_ready = bool(sub2_dir or sub2_url)
+        if not cpa_ready and not sub2_ready:
+            self.log(
+                "[!] 请先配置 Sub2API（导入目录或远程地址）或 CPA auth 目录/远程地址"
+            )
             return
-        if config["cpa_remote_url"] and not config["cpa_management_key"]:
+        if cpa_remote and not cpa_key:
             self.log("[!] 已配置 CPA 远程地址，但缺少管理密钥")
             return
+        if sub2_ready and sub2_url and not sub2_token:
+            self.log("[!] 已配置 Sub2API 远程地址，但缺少管理 Token")
+            return
         save_config()
+        # 补转会话内临时开启直出（不改写用户勾选偏好到磁盘之外：磁盘已按界面保存）
+        if sub2_ready:
+            config["sub2api_auto_add"] = True
 
         self.sso_convert_running = True
         self.sso_convert_stop_requested = False
@@ -3579,10 +4052,11 @@ class GrokRegisterGUI:
         self.stop_btn.config(state=tk.NORMAL)
         self.status_var.set("SSO 补转中...")
         self.status_label.config(foreground="blue")
-        self.log("[*] 开始扫描 accounts_*.txt 和 sso_pending.txt，补转缺失 SSO...")
+        begin_run_output(log_callback=self.log)
+        self.log("[*] 开始扫描 accounts / failed_sso / sso_pending，补转缺失 SSO...")
 
         def _job():
-            result = None
+            result = {"total": 0, "ok": 0, "skipped": 0, "fail": 0, "stopped": False}
             error = ""
             try:
                 entries, files = _s2cpa.scan_sso_entries(APP_DIR)
@@ -3591,7 +4065,6 @@ class GrokRegisterGUI:
                     f"去重后 {len(entries)} 个 SSO"
                 )
                 if not entries:
-                    result = {"total": 0, "ok": 0, "skipped": 0, "fail": 0, "stopped": False}
                     self.log("[补转] [!] 未找到可转换的 SSO")
                 else:
                     try:
@@ -3600,16 +4073,60 @@ class GrokRegisterGUI:
                         workers = int(config.get("register_workers", 1) or 1)
                     workers = max(1, min(workers, 8))
                     self.log(f"[补转] 并发分片 workers={workers}")
-                    result = _s2cpa.convert_sso_entries(
-                        entries,
-                        cpa_auth_dir=config["cpa_auth_dir"] or None,
-                        cpa_remote_url=config["cpa_remote_url"] or None,
-                        cpa_management_key=config["cpa_management_key"] or None,
-                        proxy=config["proxy"],
-                        workers=workers,
-                        log=lambda message: self.log(f"[补转] {str(message).strip()}"),
-                        should_stop=lambda: self.sso_convert_stop_requested,
-                    )
+                    result["total"] = len(entries)
+
+                    if sub2_ready:
+                        begin_sub2api_batch_session(log_callback=self.log)
+                        ok = skip = fail = 0
+                        for idx, (email, sso) in enumerate(entries, 1):
+                            if self.sso_convert_stop_requested:
+                                result["stopped"] = True
+                                break
+                            label = email or f"sso#{idx}"
+                            self.log(f"[补转] [{idx}/{len(entries)}] Sub2API: {label}")
+                            future = add_sso_to_sub2api(
+                                sso,
+                                email=email,
+                                log_callback=self.log,
+                                should_stop=lambda: self.sso_convert_stop_requested,
+                            )
+                            if wait_sub2api_account_result(future):
+                                ok += 1
+                            else:
+                                fail += 1
+                                persist_failed_sso(
+                                    email,
+                                    "",
+                                    sso,
+                                    reason="补转失败",
+                                    log_callback=self.log,
+                                )
+                        wait_sub2api_pending(log_callback=self.log)
+                        result["ok"] += ok
+                        result["fail"] += fail
+                        result["skipped"] += skip
+                        self.log(
+                            f"[补转] Sub2API 完成: 成功 {ok} / 失败 {fail} / 共 {len(entries)}"
+                        )
+
+                    if cpa_ready and not self.sso_convert_stop_requested:
+                        cpa_result = _s2cpa.convert_sso_entries(
+                            entries,
+                            cpa_auth_dir=cpa_dir or None,
+                            cpa_remote_url=cpa_remote or None,
+                            cpa_management_key=cpa_key or None,
+                            proxy=config.get("proxy", ""),
+                            workers=workers,
+                            log=lambda message: self.log(f"[补转] {str(message).strip()}"),
+                            should_stop=lambda: self.sso_convert_stop_requested,
+                        )
+                        if isinstance(cpa_result, dict):
+                            result["ok"] += int(cpa_result.get("ok", 0) or 0)
+                            result["fail"] += int(cpa_result.get("fail", 0) or 0)
+                            result["skipped"] += int(cpa_result.get("skipped", 0) or 0)
+                            result["stopped"] = result["stopped"] or bool(
+                                cpa_result.get("stopped")
+                            )
             except Exception as exc:
                 error = str(exc)
             self.ui_queue.put((self._on_sso_recovery_done, (result, error)))
@@ -3657,6 +4174,11 @@ class GrokRegisterGUI:
         workers = max(1, min(int(workers or 1), 8, int(count or 1)))
         # 启动 Sub2API 批次会话（共享写入器 + 并行验活线程池），供各 worker 复用
         begin_sub2api_batch_session(log_callback=self.log)
+        reset_proxy_rotator()
+        rotator = get_proxy_rotator()
+        if rotator is not None:
+            self.log(f"[*] 代理池已加载：{rotator.summary()} | 每IP成功上限={config.get('proxy_accounts_per_ip', 1)}")
+            self.log("[*] 提示：使用代理池时请关闭系统 TUN，否则浏览器可能仍走 TUN 出口")
         try:
             if workers <= 1:
                 self.run_registration(count, worker_id=0, workers=1)
@@ -3703,6 +4225,7 @@ class GrokRegisterGUI:
                 self.log(text)
 
         try:
+            bind_proxy_for_account(log_callback=wlog, force_new=True)
             start_browser(log_callback=wlog)
             wlog("[*] 浏览器已启动")
             i = 0
@@ -3712,6 +4235,10 @@ class GrokRegisterGUI:
                 if self.should_stop():
                     break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+                prev_proxy = resolve_active_proxy()
+                next_proxy = bind_proxy_for_account(log_callback=wlog)
+                if next_proxy != prev_proxy or _active_browser() is None:
+                    restart_browser(log_callback=wlog, proxy=next_proxy)
                 try:
                     email = ""
                     dev_token = ""
@@ -3730,8 +4257,9 @@ class GrokRegisterGUI:
                         wlog(f"[*] 邮箱: {email}")
                         wlog(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
+                            os.makedirs(MAIL_OUTPUT_ROOT, exist_ok=True)
                             with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                MAIL_CREDENTIALS_FILE,
                                 "a",
                                 encoding="utf-8",
                             ) as f:
@@ -3780,10 +4308,32 @@ class GrokRegisterGUI:
                         else:
                             wlog(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                     lock = getattr(self, "_stats_lock", None)
+                    password = str((profile or {}).get("password") or "")
+                    persist_obtained_sso(
+                        email,
+                        password,
+                        sso,
+                        accounts_file=self.accounts_output_file,
+                        log_callback=wlog,
+                    )
                     export_ok = wait_sub2api_account_result(
-                        add_sso_to_sub2api(sso, email=email, log_callback=wlog, should_stop=self.should_stop)
+                        add_sso_to_sub2api(
+                            sso,
+                            email=email,
+                            password=password,
+                            log_callback=wlog,
+                            should_stop=self.should_stop,
+                        )
                     )
                     if not export_ok:
+                        persist_failed_sso(
+                            email,
+                            password,
+                            sso,
+                            reason="换 token 或验活失败",
+                            log_callback=wlog,
+                        )
+                        note_proxy_account_fail(log_callback=wlog)
                         raise Exception("换 token 或验活失败，不计入成功")
                     add_sso_to_cpa(sso, email=email, log_callback=wlog, should_stop=self.should_stop)
                     if lock:
@@ -3791,22 +4341,13 @@ class GrokRegisterGUI:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        alock = getattr(self, "_accounts_lock", None)
-                        if alock:
-                            with alock:
-                                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                                    f.write(line)
-                        else:
-                            with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                                f.write(line)
-                    except Exception as file_exc:
-                        wlog(f"[Debug] 保存账号文件失败: {file_exc}")
                     self._record_success()
                     retry_count_for_slot = 0
                     i += 1
                     wlog(f"[+] 验活成功并计入: {email}")
+                    if note_proxy_account_success(log_callback=wlog):
+                        # 达上限：下一轮 bind 会换新 IP 并重启浏览器
+                        pass
                     if (
                         self.success_count > 0
                         and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
@@ -3844,6 +4385,11 @@ class GrokRegisterGUI:
                     retry_count_for_slot = 0
                     i += 1
                     wlog(f"[-] 注册失败 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+                    # IP 被锁时同出口继续开多半全死，失败即退役该代理
+                    if kind == FAIL_VERIFY or "验活" in str(exc) or "换 token" in str(exc):
+                        note_proxy_account_fail(log_callback=wlog)
+                    elif bool(config.get("proxy_rotate_on_fail", True)):
+                        note_proxy_account_fail(log_callback=wlog)
                 finally:
                     self.update_stats()
                     if self.should_stop():
@@ -3916,16 +4462,20 @@ def run_registration_cli(count):
     fail_stats = empty_fail_stats()
     retry_count_for_slot = 0
     max_slot_retry = 3
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-    )
+    accounts_run = begin_run_output(log_callback=cli_log)
+    accounts_output_file = accounts_run["accounts_file"]
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 8, int(count or 1)))
     cli_log(f"[*] 终端模式启动，目标数量: {count} | 并发: {workers}")
     cli_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
     cli_log(f"[*] SSO→Sub2API: {'开' if config.get('sub2api_auto_add') else '关'}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    cli_log(f"[*] 换 token/验活失败 SSO → {accounts_run['failed_file']}")
     begin_sub2api_batch_session(log_callback=cli_log)
+    reset_proxy_rotator()
+    rotator = get_proxy_rotator()
+    if rotator is not None:
+        cli_log(f"[*] 代理池已加载：{rotator.summary()} | 每IP成功上限={config.get('proxy_accounts_per_ip', 1)}")
+        cli_log("[*] 提示：使用代理池时请关闭系统 TUN，否则浏览器可能仍走 TUN 出口")
 
     def _cli_record_failure(exc):
         nonlocal fail_count
@@ -3948,10 +4498,23 @@ def run_registration_cli(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             try:
+                bind_proxy_for_account(
+                    log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                    force_new=True,
+                )
                 start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 i = 0
                 retry = 0
                 while i < n and not controller.should_stop():
+                    prev_proxy = resolve_active_proxy()
+                    next_proxy = bind_proxy_for_account(
+                        log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                    )
+                    if next_proxy != prev_proxy or _active_browser() is None:
+                        restart_browser(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            proxy=next_proxy,
+                        )
                     try:
                         open_signup_page(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
@@ -3985,25 +4548,43 @@ def run_registration_cli(count):
                                 user_agent=browser_ua,
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        password = str((profile or {}).get("password") or "")
+                        persist_obtained_sso(
+                            email,
+                            password,
+                            sso,
+                            accounts_file=accounts_output_file,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         export_ok = wait_sub2api_account_result(
                             add_sso_to_sub2api(
                                 sso,
                                 email=email,
+                                password=password,
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                                 should_stop=controller.should_stop,
                             )
                         )
                         if not export_ok:
+                            persist_failed_sso(
+                                email,
+                                password,
+                                sso,
+                                reason="换 token 或验活失败",
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            )
+                            note_proxy_account_fail(
+                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                            )
                             raise Exception("换 token 或验活失败，不计入成功")
                         add_sso_to_cpa(sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"), should_stop=controller.should_stop)
-                        with accounts_lock:
-                            with open(accounts_output_file, "a", encoding="utf-8") as f:
-                                f.write(line)
                         local_success += 1
                         i += 1
                         retry = 0
                         cli_log(f"[W{wid+1}] [+] 验活成功并计入: {email}")
+                        note_proxy_account_success(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                        )
                     except RegistrationCancelled:
                         break
                     except EmailDomainRejected as exc:
@@ -4069,6 +4650,7 @@ def run_registration_cli(count):
         return
 
     try:
+        bind_proxy_for_account(log_callback=cli_log, force_new=True)
         start_browser(log_callback=cli_log)
         cli_log("[*] 浏览器已启动")
         i = 0
@@ -4076,6 +4658,10 @@ def run_registration_cli(count):
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
+            prev_proxy = resolve_active_proxy()
+            next_proxy = bind_proxy_for_account(log_callback=cli_log)
+            if next_proxy != prev_proxy or _active_browser() is None:
+                restart_browser(log_callback=cli_log, proxy=next_proxy)
             try:
                 email = ""
                 dev_token = ""
@@ -4094,8 +4680,9 @@ def run_registration_cli(count):
                     cli_log(f"[*] 邮箱: {email}")
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                     try:
+                        os.makedirs(MAIL_OUTPUT_ROOT, exist_ok=True)
                         with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                            MAIL_CREDENTIALS_FILE,
                             "a",
                             encoding="utf-8",
                         ) as f:
@@ -4143,25 +4730,39 @@ def run_registration_cli(count):
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                except Exception:
-                    line = f"{email}--------{sso}\n"
+                password = str((profile or {}).get("password") or "")
+                persist_obtained_sso(
+                    email,
+                    password,
+                    sso,
+                    accounts_file=accounts_output_file,
+                    log_callback=cli_log,
+                )
                 export_ok = wait_sub2api_account_result(
-                    add_sso_to_sub2api(sso, email=email, log_callback=cli_log, should_stop=controller.should_stop)
+                    add_sso_to_sub2api(
+                        sso,
+                        email=email,
+                        password=password,
+                        log_callback=cli_log,
+                        should_stop=controller.should_stop,
+                    )
                 )
                 if not export_ok:
+                    persist_failed_sso(
+                        email,
+                        password,
+                        sso,
+                        reason="换 token 或验活失败",
+                        log_callback=cli_log,
+                    )
+                    note_proxy_account_fail(log_callback=cli_log)
                     raise Exception("换 token 或验活失败，不计入成功")
                 add_sso_to_cpa(sso, email=email, log_callback=cli_log, should_stop=controller.should_stop)
-                try:
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[+] 验活成功并计入: {email}")
+                note_proxy_account_success(log_callback=cli_log)
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
                     cleanup_runtime_memory(

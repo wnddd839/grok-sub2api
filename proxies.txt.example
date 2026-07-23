@@ -1,0 +1,8 @@
+# 每行一个 HTTP/SOCKS 代理，注册机按「每 IP 成功 N 个」轮换
+# 格式示例：
+# http://127.0.0.1:7890
+# http://user:pass@host:port
+# socks5://user:pass@host:port
+#
+# 建议：住宅代理；注册与换 token 使用同一条（粘住）。
+# 使用代理池时请关掉系统 TUN，否则浏览器仍可能走 TUN 出口。

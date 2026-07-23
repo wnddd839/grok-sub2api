@@ -74,6 +74,7 @@ def create_temp_address(
     auth_mode: str = "none",
     custom_auth: str = "",
     name: str = "",
+    enable_random_subdomain: bool = False,
 ) -> tuple[str, str]:
     path = accounts_path if accounts_path.startswith("/") else f"/{accounts_path}"
     url = f"{api_base.rstrip('/')}{path}"
@@ -81,11 +82,16 @@ def create_temp_address(
         payload = {"name": name or generate_username(10), "enablePrefix": True}
         if domain:
             payload["domain"] = domain
+        if enable_random_subdomain:
+            # cloudflare_temp_email：user@随机子域.主域 → 三级域名收信
+            payload["enableRandomSubdomain"] = True
         headers = build_headers(api_key, auth_mode, custom_auth, content_type=True)
     else:
         payload = {}
         if domain:
             payload["domain"] = domain
+        if enable_random_subdomain:
+            payload["enableRandomSubdomain"] = True
         headers = apply_custom_auth({"Content-Type": "application/json"}, custom_auth)
     resp = http_post(url, json=payload, headers=headers)
     resp.raise_for_status()

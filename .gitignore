@@ -21,8 +21,13 @@ config.local.*
 .env
 .env.*
 
-# 账号 / 凭证 / OAuth 输出 — 禁止提交
+# 统一运行产物目录
+output/
+
+# 兼容旧路径（若仍残留）
 accounts_*.txt
+sso_for_sub2api_*.txt
+sso_pending.txt
 mail_credentials.txt
 sso_list.txt
 sso_out/
@@ -41,12 +46,17 @@ cpa_auth/
 # 通用文本日志（保留依赖清单）
 *.txt
 !requirements.txt
+!tools/requirements.local.txt
 *.log
 
 # 本地一次性调试脚本 / 上游对照快照
+_organize_once.py
 _compare_cpa.py
 _compare_*.py
 _merge_*.py
+tools/.tmp*
+tools/_compare_*.py
+tools/upstream_snap/
 .upstream_snap/
 
 # 编辑器 / 系统

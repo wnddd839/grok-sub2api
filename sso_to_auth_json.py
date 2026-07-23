@@ -58,9 +58,13 @@ GROK_PLAN = "generic"
 GROK_VERSION = "0.2.93"
 GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
 # consent 提交用的 Next.js Server Action ID（快速路径；失效时再从 consent 页 JS 动态解析）
-# 2026-07 实测 createServerReference 在 accounts.x.ai chunks 内，HTML 里的 400b2e4e... 不是 consent allow
-NEXT_ACTION_ID = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
+# 2026-07-23 实测 allow consent：40b1f238edcd...（旧 401b73e22a5e... 已 404）
+# HTML / 其它 createServerReference（如 00624c37...）常为 200 但非 allow
+NEXT_ACTION_ID = "40b1f238edcd2299db9b5d17c8777cfbab7cc3d889"
 _working_next_action_id = NEXT_ACTION_ID
+_LEGACY_NEXT_ACTION_IDS = (
+    "401b73e22a5e68737d0037e1aa449fef82cd1b35fb",
+)
 _NEXT_ACTION_RE = re.compile(
     r'(?:\$ACTION_ID_|next-action["\']?\s*[:=]\s*["\']|["\'])([0-9a-f]{40,44})["\']',
     re.I,
@@ -91,8 +95,29 @@ CPA_GROK_HEADERS = {
 }
 CPA_PROBE_MODEL = "grok-4.5"
 CPA_PROBE_URL = f"{CPA_GROK_BASE_URL}/responses"
-AUTO_SSO_PATTERNS = ("accounts_*.txt", "sso_pending.txt")
+AUTO_SSO_PATTERNS = (
+    "accounts_*.txt",
+    "accounts.txt",
+    "sso_pending.txt",
+    "failed_sso.txt",
+    "sso_for_sub2api_*.txt",
+)
 
+# --- Sub2API (Wei-Shaw/sub2api) Grok OAuth credentials ----------------------
+# Align BuildAccountCredentials; keep CLI headers to avoid 426 version(none).
+SUB2API_CLIENT_ID = CLIENT_ID
+SUB2API_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+# 字面量常量，避免个别热重载/半导入场景下 NameError
+_SUB2API_BASE_URL_DEFAULT = "https://cli-chat-proxy.grok.com/v1"
+SUB2API_BASE_URL = _SUB2API_BASE_URL_DEFAULT
+SUB2API_VERIFY_HEADERS = {
+    "User-Agent": GROK_TOKEN_UA,
+    "X-XAI-Token-Auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-identifier": "grok-pager",
+    "x-grok-client-version": GROK_VERSION,
+    "Accept": "application/json",
+}
 
 
 def verify_grok_credentials(
@@ -104,7 +129,9 @@ def verify_grok_credentials(
     access = str((creds or {}).get("access_token") or "").strip()
     if not access:
         return False, "missing access_token"
-    base = str((creds or {}).get("base_url") or SUB2API_BASE_URL).strip().rstrip("/")
+    base = str(
+        (creds or {}).get("base_url") or _SUB2API_BASE_URL_DEFAULT
+    ).strip().rstrip("/")
     url = f"{base}/models"
     headers = dict(SUB2API_VERIFY_HEADERS)
     headers["Authorization"] = f"Bearer {access}"
@@ -130,6 +157,48 @@ def verify_grok_credentials(
     if body:
         detail = f"{detail}: {body}"
     return False, detail
+
+
+def probe_grok_responses(
+    creds: dict,
+    proxy: str = "",
+    timeout: int = 30,
+    model: str = CPA_PROBE_MODEL,
+) -> tuple[int | None, str]:
+    """直连 cli-chat-proxy /responses，返回 (HTTP 状态码, 响应摘要)。
+
+    这是真正触发 spending-limit 的路径；/models 验活过了仍可能在这里 402。
+    """
+    access = str((creds or {}).get("access_token") or "").strip()
+    if not access:
+        return None, "missing access_token"
+    base = str(
+        (creds or {}).get("base_url") or _SUB2API_BASE_URL_DEFAULT
+    ).strip().rstrip("/")
+    url = f"{base}/responses"
+    headers = dict(SUB2API_VERIFY_HEADERS)
+    headers["Authorization"] = f"Bearer {access}"
+    headers["Content-Type"] = "application/json"
+    kwargs = {
+        "headers": headers,
+        "json": {
+            "model": model,
+            "input": "ping",
+            "max_output_tokens": 2,
+            "stream": False,
+        },
+        "impersonate": "chrome",
+        "timeout": timeout,
+    }
+    proxy = str(proxy or "").strip()
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    try:
+        resp = requests.post(url, **kwargs)
+        summary = str(resp.text or "").replace("\n", " ").strip()
+        return int(resp.status_code), summary[:300]
+    except Exception as exc:
+        return None, str(exc)[:300]
 
 
 
@@ -257,6 +326,7 @@ def _discover_action_ids_from_js(
 
     fetched = 0
     max_fetch = 40
+    allow_near: list[str] = []  # 靠近 "allow" 字样的 createServerReference，最高优先
     for score, src in scored:
         if should_stop and should_stop():
             break
@@ -269,12 +339,22 @@ def _discover_action_ids_from_js(
         except Exception:
             continue
         fetched += 1
-        prefer = score > 0 or ("consent" in text.lower() and "oauth" in text.lower())
+        low_text = text.lower()
+        prefer = score > 0 or ("consent" in low_text and "oauth" in low_text)
         # 含 allow + createServerReference 的 chunk 更优先
         if "createServerReference" in text or "callServer" in text:
             prefer = True
         for m in _CREATE_SERVER_REF_RE.finditer(text):
-            _add(m.group(1), prefer=prefer)
+            aid = m.group(1)
+            # 窗口内出现 allow / action":"allow 时视为 consent allow 强候选
+            window = text[max(0, m.start() - 80) : m.end() + 120]
+            if re.search(r'allow|action["\']?\s*:\s*["\']allow', window, re.I):
+                _add(aid, prefer=True)
+                v = aid.strip().lower()
+                if v and v not in allow_near:
+                    allow_near.append(v)
+            else:
+                _add(aid, prefer=prefer)
         for m in _CALL_SERVER_RE.finditer(text):
             _add(m.group(1), prefer=prefer)
 
@@ -282,7 +362,19 @@ def _discover_action_ids_from_js(
     for aid in _extract_next_action_ids(html):
         _add(aid, prefer=False)
 
-    ordered = priority + [x for x in found if x not in priority]
+    # 过期内置 ID 沉底，避免快速路径反复 404
+    legacy = {x.lower() for x in _LEGACY_NEXT_ACTION_IDS}
+    ordered = []
+    for group in (allow_near, priority, found):
+        for aid in group:
+            if aid in ordered:
+                continue
+            ordered.append(aid)
+    ordered = [x for x in ordered if x not in legacy] + [x for x in ordered if x in legacy]
+    # 当前已知可用常量仍放最前（探测验证过）；若又失效，404 后会清缓存并扫 JS
+    current = str(NEXT_ACTION_ID or "").strip().lower()
+    if current and current not in legacy:
+        ordered = [current] + [x for x in ordered if x != current]
     if log:
         log(f"  [*] 从 JS chunks 解析 Next-Action {len(ordered)} 个（扫 {fetched} 个脚本）")
     return ordered
@@ -467,6 +559,9 @@ def sso_to_token(
             if r.status_code == 404 or "server action not found" in body.lower():
                 last_err = f"consent HTTP {r.status_code}: {body[:160]}"
                 log(f"  ⚠️ Next-Action {action_id[:12]}... 无效: {last_err}")
+                # 缓存 ID 已过期：清掉，迫使下一轮走 JS 动态解析
+                if str(_working_next_action_id or "").strip().lower() == action_id:
+                    _working_next_action_id = ""
                 continue
             if r.status_code < 200 or r.status_code >= 300:
                 last_err = f"consent HTTP {r.status_code}: {body[:200]}"
@@ -737,7 +832,7 @@ def token_to_sub2api_credentials(token: dict, email: str = "") -> dict:
     creds: dict = {
         "access_token": access,
         "expires_at": expires_at,
-        "base_url": SUB2API_BASE_URL,
+        "base_url": _SUB2API_BASE_URL_DEFAULT,
         "client_id": SUB2API_CLIENT_ID,
         "scope": SUB2API_SCOPE,
     }
@@ -962,6 +1057,148 @@ def write_sub2api_auth(auth_dir: Path, creds: dict) -> Path:
     return path
 
 
+def sub2api_credentials_to_cpa_record(creds: dict, sso: str = "") -> dict:
+    """Sub2API credentials → CPA 扁平 xai auth 记录（离线，不换 token）。"""
+    if not isinstance(creds, dict):
+        raise ValueError("credentials 必须是对象")
+    access = str(creds.get("access_token") or creds.get("key") or "").strip()
+    if not access:
+        raise ValueError("缺少 access_token")
+
+    token = {
+        "access_token": access,
+        "refresh_token": str(creds.get("refresh_token") or "").strip(),
+        "id_token": str(creds.get("id_token") or "").strip(),
+        "token_type": str(creds.get("token_type") or "Bearer").strip() or "Bearer",
+    }
+    if creds.get("expires_in") is not None:
+        token["expires_in"] = creds.get("expires_in")
+
+    email = str(creds.get("email") or "").strip()
+    record = token_to_cpa_record(token, email=email, sso=sso)
+
+    # Sub2 的 expires_at（ISO/unix）可补 CPA.expired（JWT 无 exp 时）
+    if not record.get("expired"):
+        unix = _sub2api_expires_unix(creds)
+        if unix is not None:
+            record["expired"] = _iso_utc_from_unix(unix)
+    return record
+
+
+def iter_sub2api_credentials(payload) -> list[dict]:
+    """从多种 Sub2API JSON 形态提取 credentials 列表。
+
+    支持：
+    - 导入包 {type: sub2api-data, accounts: [...]}
+    - 单账号 {platform, type, credentials}
+    - 纯 credentials {access_token, ...}
+    - 账号数组 / credentials 数组
+    """
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        out: list[dict] = []
+        for item in payload:
+            out.extend(iter_sub2api_credentials(item))
+        return out
+
+    if not isinstance(payload, dict):
+        return []
+
+    accounts = payload.get("accounts")
+    if isinstance(accounts, list) and (
+        payload.get("type") == SUB2API_DATA_TYPE or "accounts" in payload
+    ):
+        out: list[dict] = []
+        for account in accounts:
+            out.extend(iter_sub2api_credentials(account))
+        return out
+
+    creds = payload.get("credentials")
+    if isinstance(creds, dict) and (
+        payload.get("platform") == "grok"
+        or payload.get("type") in ("oauth", "xai")
+        or "access_token" in creds
+        or "refresh_token" in creds
+    ):
+        return [creds]
+
+    if payload.get("access_token") or payload.get("refresh_token"):
+        return [payload]
+
+    return []
+
+
+def load_sub2api_credentials_from_path(path: str | Path) -> list[tuple[Path, dict]]:
+    """从文件或目录加载 (来源路径, credentials)。目录递归扫描 *.json。"""
+    root = Path(path)
+    if not root.exists():
+        raise FileNotFoundError(f"路径不存在: {root}")
+
+    if root.is_file():
+        files = [root]
+    else:
+        files = sorted(p for p in root.rglob("*.json") if p.is_file())
+
+    results: list[tuple[Path, dict]] = []
+    for file_path in files:
+        try:
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"无法解析 JSON: {file_path}: {exc}") from exc
+        for creds in iter_sub2api_credentials(data):
+            results.append((file_path, creds))
+    return results
+
+
+def convert_sub2api_path_to_cpa(
+    input_path: str | Path,
+    output_dir: str | Path,
+    *,
+    skip_existing: bool = False,
+) -> dict:
+    """批量 Sub2API JSON → 本地 CPA xai-*.json。
+
+    返回 {ok, fail, skipped, written: [path], errors: [(src, msg)]}。
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    items = load_sub2api_credentials_from_path(input_path)
+
+    stats: dict = {
+        "ok": 0,
+        "fail": 0,
+        "skipped": 0,
+        "written": [],
+        "errors": [],
+    }
+    seen_emails: set[str] = set()
+
+    for src, creds in items:
+        try:
+            record = sub2api_credentials_to_cpa_record(creds)
+            email_key = str(record.get("email") or "").strip().casefold()
+            if email_key and email_key in seen_emails:
+                stats["skipped"] += 1
+                continue
+            target = out_dir / cpa_auth_filename(record)
+            if skip_existing and target.exists():
+                stats["skipped"] += 1
+                if email_key:
+                    seen_emails.add(email_key)
+                continue
+            path = write_cpa_auth(out_dir, record)
+            stats["ok"] += 1
+            stats["written"].append(str(path))
+            if email_key:
+                seen_emails.add(email_key)
+        except Exception as exc:
+            stats["fail"] += 1
+            stats["errors"].append((str(src), str(exc)))
+    return stats
+
+
 def upload_sub2api_account(
     base_url: str,
     admin_token: str,
@@ -1077,14 +1314,31 @@ def merge_auth_json(path: Path, auth_key: str, entry: dict, unique: bool = True)
 
 
 def parse_sso_line(raw_line: str) -> tuple[str, str]:
-    """解析一行 SSO，返回 (email, sso)。"""
+    """解析一行 SSO，返回 (email, sso)。
+
+    支持:
+      - 纯 SSO
+      - 邮箱----SSO
+      - 邮箱----密码----SSO
+      - 邮箱----密码----SSO----备注（失败原因等；SSO 取 JWT 段）
+    """
     line = str(raw_line or "").strip()
+    if not line:
+        return "", ""
     if "----" not in line:
         return "", line
-    parts = line.split("----")
-    first = parts[0].strip()
-    email = first if "@" in first and len(parts) >= 2 else ""
-    return email, parts[-1].strip()
+    parts = [p.strip() for p in line.split("----") if p.strip()]
+    if not parts:
+        return "", ""
+    email = parts[0] if "@" in parts[0] else ""
+    # 优先取看起来像 JWT 的段（sso cookie）
+    for part in reversed(parts):
+        if part.startswith("eyJ") and part.count(".") >= 2:
+            return email, part
+    # 回退：有邮箱时取第 3 段（邮箱----密码----sso），否则取最后一段
+    if email and len(parts) >= 3:
+        return email, parts[2]
+    return email, parts[-1]
 
 
 def load_sso_entries(path: str | None, single: str | None) -> list[tuple[str, str]]:
@@ -1219,12 +1473,31 @@ def collect_remote_auth_emails(
 
 
 def discover_sso_files(scan_dir: str | Path = ".") -> list[Path]:
+    """扫描根目录及 output/runs|failed_sso|legacy 下的账号/失败 SSO 文本。"""
     root = Path(scan_dir)
     found: dict[Path, None] = {}
+
+    def _add(path: Path) -> None:
+        if path.is_file():
+            found[path.resolve()] = None
+
     for pattern in AUTO_SSO_PATTERNS:
         for path in sorted(root.glob(pattern)):
-            if path.is_file():
-                found[path] = None
+            _add(path)
+
+    output_root = root / "output"
+    if output_root.is_dir():
+        for sub in ("runs", "failed_sso", "legacy"):
+            base = output_root / sub
+            if not base.is_dir():
+                continue
+            for pattern in AUTO_SSO_PATTERNS:
+                for path in sorted(base.glob(f"*/{pattern}")):
+                    _add(path)
+                for path in sorted(base.glob(f"*/*/{pattern}")):
+                    _add(path)
+                for path in sorted(base.glob(pattern)):
+                    _add(path)
     return list(found)
 
 

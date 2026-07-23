@@ -1,5 +1,11 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+import sys
+
+TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
 import cf_mail_debug
 import grok_register_ttk as app
@@ -22,6 +28,7 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.original_config = app.config.copy()
         self.original_cf_domain_index = app._cf_domain_index
         app._cf_domain_index = 0
+        app.config["cloudflare_random_subdomain"] = False
 
     def tearDown(self):
         app.config = self.original_config
@@ -51,6 +58,7 @@ class CloudflareAdminCreateTests(unittest.TestCase):
             "cloudflare_auth_mode": "x-admin-auth",
             "cloudflare_path_accounts": "/admin/new_address",
             "defaultDomains": "vitassk.com",
+            "cloudflare_random_subdomain": False,
         })
         captured = {}
 
@@ -73,6 +81,37 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         })
         self.assertEqual(captured["headers"]["Content-Type"], "application/json")
         self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
+
+    def test_app_admin_new_address_can_enable_random_subdomain(self):
+        app.config.update({
+            "cloudflare_api_key": "admin-secret",
+            "cloudflare_auth_mode": "x-admin-auth",
+            "cloudflare_path_accounts": "/admin/new_address",
+            "defaultDomains": "vitassk.com",
+            "cloudflare_random_subdomain": True,
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return DummyResponse({
+                "address": "adminuser@abcd1234.vitassk.com",
+                "jwt": "address-jwt",
+            })
+
+        with patch.object(app, "generate_username", return_value="adminuser"), \
+                patch.object(app, "http_post", side_effect=fake_post):
+            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+
+        self.assertEqual(address, "adminuser@abcd1234.vitassk.com")
+        self.assertEqual(jwt, "address-jwt")
+        self.assertEqual(captured["json"], {
+            "name": "adminuser",
+            "domain": "vitassk.com",
+            "enablePrefix": True,
+            "enableRandomSubdomain": True,
+        })
 
     def test_app_keeps_anonymous_new_address_with_none_auth(self):
         app.config.update({
