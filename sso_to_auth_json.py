@@ -126,38 +126,68 @@ def verify_grok_credentials(
     proxy: str = "",
     timeout: int = 25,
 ) -> tuple[bool, str]:
-    """Probe cli-chat-proxy /models once. Returns (ok, message)."""
-    access = str((creds or {}).get("access_token") or "").strip()
-    if not access:
-        return False, "missing access_token"
-    base = str(
-        (creds or {}).get("base_url") or _SUB2API_BASE_URL_DEFAULT
-    ).strip().rstrip("/")
-    url = f"{base}/models"
-    headers = dict(SUB2API_VERIFY_HEADERS)
-    headers["Authorization"] = f"Bearer {access}"
-    kwargs = {
-        "headers": headers,
-        "timeout": timeout,
-        "impersonate": "chrome",
-    }
-    proxy = str(proxy or "").strip()
-    if proxy:
-        kwargs["proxies"] = {"http": proxy, "https": proxy}
-    try:
-        resp = requests.get(url, **kwargs)
-    except Exception as exc:
-        return False, f"request_error: {exc}"
-    status = int(getattr(resp, "status_code", 0) or 0)
-    body = (getattr(resp, "text", "") or "").strip().replace("\n", " ")
-    if len(body) > 160:
-        body = body[:160] + "..."
-    if 200 <= status < 400:
-        return True, f"HTTP {status}"
+    """Probe cli-chat-proxy chat 可用性。仅 HTTP 2xx 为 True。
+
+    已改为打 /responses（与真实调用一致）；/models 易假活。
+    需要区分 402/403 时请用 verify_grok_chat()。
+    """
+    verdict, message = verify_grok_chat(creds, proxy=proxy, timeout=timeout)
+    return verdict == VERDICT_ALIVE, message
+
+
+VERDICT_ALIVE = "alive"
+VERDICT_HOLD_402 = "hold_402"
+VERDICT_DROP_403 = "drop_403"
+VERDICT_FAIL = "fail"
+
+
+def classify_grok_chat_status(status: int | None, body: str = "") -> str:
+    """根据 /responses 结果分类：alive / hold_402 / drop_403 / fail。"""
+    text = (body or "").lower()
+    if status is not None and 200 <= int(status) < 300:
+        return VERDICT_ALIVE
+    if (
+        status == 402
+        or "spending-limit" in text
+        or "personal-team-blocked" in text
+        or "run out of credits" in text
+    ):
+        return VERDICT_HOLD_402
+    if (
+        status == 403
+        or "permission-denied" in text
+        or "chat endpoint is denied" in text
+    ):
+        return VERDICT_DROP_403
+    return VERDICT_FAIL
+
+
+def verify_grok_chat(
+    creds: dict,
+    proxy: str = "",
+    timeout: int = 30,
+    model: str = CPA_PROBE_MODEL,
+) -> tuple[str, str]:
+    """打 /responses 并返回 (verdict, message)。
+
+    - alive: 可立即进池
+    - hold_402: 额度/风控，保留待复活，勿丢
+    - drop_403: 权限拒绝（坏 token/无 referrer），应丢弃或重铸
+    - fail: 其它错误
+    """
+    status, body = probe_grok_responses(
+        creds, proxy=proxy, timeout=timeout, model=model
+    )
+    verdict = classify_grok_chat_status(status, body)
+    if status is None:
+        return verdict, body or "request_error"
     detail = f"HTTP {status}"
-    if body:
-        detail = f"{detail}: {body}"
-    return False, detail
+    summary = (body or "").strip()
+    if summary:
+        if len(summary) > 180:
+            summary = summary[:180] + "..."
+        detail = f"{detail}: {summary}"
+    return verdict, detail
 
 
 def probe_grok_responses(

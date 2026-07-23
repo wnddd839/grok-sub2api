@@ -755,8 +755,10 @@ def begin_run_output(stamp: str | None = None, log_callback=None) -> dict:
     """为本轮注册创建分目录输出：
 
     output/runs/<时间>/
-      sso/        ← 原始 SSO（与 token 分开）
-      verified/   ← 验活成功的 token
+      sso/          ← 原始 SSO
+      verified/     ← /responses 200，可进池
+      hold_402/     ← 402 留观（待复活）
+      discard_403/  ← 403 丢弃
     output/failed_sso/<时间>/
       failed_sso.txt
     """
@@ -766,18 +768,25 @@ def begin_run_output(stamp: str | None = None, log_callback=None) -> dict:
     run_dir = os.path.join(RUNS_ROOT, stamp)
     sso_dir = os.path.join(run_dir, "sso")
     verified_dir = os.path.join(run_dir, "verified")
+    hold_dir = os.path.join(run_dir, "hold_402")
+    discard_dir = os.path.join(run_dir, "discard_403")
     failed_dir = os.path.join(FAILED_SSO_ROOT, stamp)
-    for path in (run_dir, sso_dir, verified_dir, failed_dir):
+    for path in (run_dir, sso_dir, verified_dir, hold_dir, discard_dir, failed_dir):
         os.makedirs(path, exist_ok=True)
     info = {
         "stamp": stamp,
         "run_dir": run_dir,
         "sso_dir": sso_dir,
         "verified_dir": verified_dir,
+        "hold_402_dir": hold_dir,
+        "discard_403_dir": discard_dir,
         "accounts_file": os.path.join(sso_dir, "accounts.txt"),
         "sso_file": os.path.join(sso_dir, "sso_for_sub2api.txt"),
         "verified_file": os.path.join(verified_dir, "verified_tokens.jsonl"),
         "verified_accounts_file": os.path.join(verified_dir, "accounts_ok.txt"),
+        "hold_402_file": os.path.join(hold_dir, "hold_402.jsonl"),
+        "hold_402_accounts_file": os.path.join(hold_dir, "accounts_hold.txt"),
+        "discard_403_file": os.path.join(discard_dir, "discard_403.txt"),
         "failed_file": os.path.join(failed_dir, "failed_sso.txt"),
     }
     with _run_output_lock:
@@ -785,6 +794,8 @@ def begin_run_output(stamp: str | None = None, log_callback=None) -> dict:
     if log_callback:
         log_callback(f"[*] 本轮 SSO 目录: {sso_dir}")
         log_callback(f"[*] 本轮验活成功 token 目录: {verified_dir}")
+        log_callback(f"[*] 402 留观目录: {hold_dir}")
+        log_callback(f"[*] 403 丢弃目录: {discard_dir}")
         log_callback(f"[*] 失败 SSO 目录: {failed_dir}")
     return dict(info)
 
@@ -911,6 +922,80 @@ def persist_failed_sso(
         return ""
     return failed_path
 
+
+def persist_hold_402(
+    email: str,
+    password: str,
+    sso: str,
+    creds: dict | None,
+    reason: str = "",
+    log_callback=None,
+) -> dict:
+    """402 spending-limit：保留 SSO+token 待复活，不进 live 导出池。"""
+    with _run_output_lock:
+        info = dict(_run_output)
+    hold_file = str(info.get("hold_402_file") or "").strip()
+    hold_accounts = str(info.get("hold_402_accounts_file") or "").strip()
+    if not hold_file:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        info = begin_run_output(stamp=stamp, log_callback=log_callback)
+        hold_file = info["hold_402_file"]
+        hold_accounts = info["hold_402_accounts_file"]
+    access = str((creds or {}).get("access_token") or "").strip()
+    refresh = str((creds or {}).get("refresh_token") or "").strip()
+    account_line = f"{email}----{password or ''}----{access}\n"
+    record = {
+        "status": "hold_402",
+        "email": email or "",
+        "password": password or "",
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": str((creds or {}).get("expires_at") or ""),
+        "base_url": str((creds or {}).get("base_url") or ""),
+        "sso": _normalize_sso_token(sso),
+        "reason": (reason or "").replace("\n", " ").strip(),
+    }
+    try:
+        with _run_output_lock:
+            _append_text_line(hold_accounts, account_line)
+            _append_text_line(hold_file, json.dumps(record, ensure_ascii=False) + "\n")
+        if log_callback:
+            log_callback(
+                f"[*] 402 留观（不导出）→ {info.get('hold_402_dir') or hold_file}"
+            )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 写入 402 留观失败: {exc}")
+    return {"hold_402_file": hold_file, "hold_402_accounts_file": hold_accounts}
+
+
+def persist_discard_403(
+    email: str,
+    password: str,
+    sso: str,
+    reason: str = "",
+    log_callback=None,
+) -> str:
+    """403 permission-denied：丢弃（可稍后用 PKCE 重铸，但默认不进池）。"""
+    sso = _normalize_sso_token(sso)
+    with _run_output_lock:
+        discard_path = str(_run_output.get("discard_403_file") or "").strip()
+    if not discard_path:
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        info = begin_run_output(stamp=stamp, log_callback=log_callback)
+        discard_path = info["discard_403_file"]
+    note = (reason or "permission-denied").replace("\n", " ").strip()
+    line = f"{email}----{password or ''}----{sso}----{note}"
+    try:
+        with _run_output_lock:
+            _append_text_line(discard_path, line + "\n")
+        if log_callback:
+            log_callback(f"[!] 403 已丢弃 → {discard_path}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 写入 403 丢弃失败: {exc}")
+        return ""
+    return discard_path
 
 def _append_sso_pending(email: str, sso: str, log_callback=None):
     """CPA 失败时保留 SSO，写入本轮 failed_sso 目录（兼容旧调用）。"""
@@ -1222,11 +1307,33 @@ def add_sso_to_sub2api(raw_token, email="", password="", log_callback=None, shou
                 token, email=payload["email"]
             )
             if payload["verify_enabled"]:
-                _s2_log(f"{label}: 验活中 ...")
-                ok, message = _s2cpa.verify_grok_credentials(
+                _s2_log(f"{label}: /responses 验活中 ...")
+                verdict, message = _s2cpa.verify_grok_chat(
                     creds, proxy=payload["proxy"]
                 )
-                if not ok:
+                if verdict == _s2cpa.VERDICT_DROP_403:
+                    _s2_log(f"{label}: 403 丢弃 ({message})")
+                    persist_discard_403(
+                        payload.get("email") or "",
+                        payload.get("password") or "",
+                        payload["sso"],
+                        reason=message,
+                        log_callback=log_callback,
+                    )
+                    return False
+                if verdict == _s2cpa.VERDICT_HOLD_402:
+                    _s2_log(f"{label}: 402 留观不导出 ({message})")
+                    persist_hold_402(
+                        payload.get("email") or "",
+                        payload.get("password") or "",
+                        payload["sso"],
+                        creds,
+                        reason=message,
+                        log_callback=log_callback,
+                    )
+                    # 开号保留，计成功；不进 Sub2API live 池
+                    return True
+                if verdict != _s2cpa.VERDICT_ALIVE:
                     _s2_log(f"{label}: 验活失败 ({message})")
                     return False
                 _s2_log(f"{label}: 验活通过 ({message})")
@@ -4232,7 +4339,7 @@ class GrokRegisterGUI:
         s_field(tk_entry(self.sub2api_frame, textvariable=self.sub2api_batch_size_var, width=12), 3, 1, sticky=tk.W)
         self._sub2api_verify_check = tk_checkbutton(
             self.sub2api_frame,
-            text="并行验活",
+            text="并行验活(/responses；402留观/403丢弃)",
             variable=self.sub2api_verify_var,
         )
         s_field(self._sub2api_verify_check, 3, 2, columnspan=2, sticky=tk.W)
@@ -5734,7 +5841,7 @@ def run_registration_cli(count):
                         local_success += 1
                         i += 1
                         retry = 0
-                        cli_log(f"[W{wid+1}] [+] 验活成功并计入: {email}")
+                        cli_log(f"[W{wid+1}] [+] 开号成功并计入: {email}")
                         note_proxy_account_success(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
                         )
@@ -6044,7 +6151,7 @@ def run_registration_cli(count):
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
-                cli_log(f"[+] 验活成功并计入: {email}")
+                cli_log(f"[+] 开号成功并计入: {email}")
                 note_proxy_account_success(log_callback=cli_log)
                 '''
                 email, password, sso, profile = register_account_once(

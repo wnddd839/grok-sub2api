@@ -71,19 +71,43 @@ class OutputLayoutTests(unittest.TestCase):
                     "eyJhbGciOiJIUzI1NiJ9.e31.sig",
                     reason="验活失败",
                 )
+                app.persist_hold_402(
+                    "hold@ex.com",
+                    "pwd4",
+                    "eyJhbGciOiJIUzI1NiJ9.e32.sig",
+                    {
+                        "access_token": "access-hold",
+                        "refresh_token": "refresh-hold",
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "base_url": "https://cli-chat-proxy.grok.com/v1",
+                    },
+                    reason="HTTP 402 spending-limit",
+                )
+                app.persist_discard_403(
+                    "drop@ex.com",
+                    "pwd5",
+                    "eyJhbGciOiJIUzI1NiJ9.e33.sig",
+                    reason="HTTP 403 permission-denied",
+                )
 
                 accounts = Path(info["accounts_file"]).read_text(encoding="utf-8")
                 verified = Path(info["verified_accounts_file"]).read_text(encoding="utf-8")
                 verified_jsonl = Path(info["verified_file"]).read_text(encoding="utf-8")
                 failed = Path(info["failed_file"]).read_text(encoding="utf-8")
+                hold = Path(info["hold_402_file"]).read_text(encoding="utf-8")
+                discard = Path(info["discard_403_file"]).read_text(encoding="utf-8")
 
                 self.assertIn("sso", Path(info["accounts_file"]).parts)
                 self.assertIn("verified", Path(info["verified_file"]).parts)
+                self.assertIn("hold_402", Path(info["hold_402_file"]).parts)
+                self.assertIn("discard_403", Path(info["discard_403_file"]).parts)
                 self.assertIn("raw@ex.com----pwd----eyJ", accounts)
                 self.assertIn("ok@ex.com----pwd2----access-ok", verified)
                 self.assertNotIn("eyJhbGciOiJIUzI1NiJ9.e30.sig", verified)
                 self.assertIn("access-ok", verified_jsonl)
                 self.assertIn("bad@ex.com----pwd3----eyJ", failed)
+                self.assertIn("access-hold", hold)
+                self.assertIn("drop@ex.com", discard)
 
 
 class Sub2APISuccessGateTests(unittest.TestCase):
@@ -130,7 +154,9 @@ class Sub2APISuccessGateTests(unittest.TestCase):
                 app.begin_run_output(stamp="20260720_testgate")
                 app.begin_sub2api_batch_session()
                 with patch.object(app._s2cpa, "sso_to_token", return_value=token), patch.object(
-                    app._s2cpa, "verify_grok_credentials", return_value=(True, "HTTP 200")
+                    app._s2cpa,
+                    "verify_grok_chat",
+                    return_value=(app._s2cpa.VERDICT_ALIVE, "HTTP 200"),
                 ), patch.object(
                     app._s2cpa,
                     "upload_sub2api_account",

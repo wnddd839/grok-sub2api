@@ -112,25 +112,39 @@ class Sub2APIExportTests(unittest.TestCase):
             )
             self.assertEqual(result["position"], 1)
 
-    def test_verify_grok_credentials_accepts_models_200(self):
+    def test_verify_grok_credentials_accepts_responses_200(self):
         response = MagicMock()
         response.status_code = 200
-        response.text = '{"data":[]}'
-        with patch.object(converter.requests, "get", return_value=response) as mocked:
+        response.text = '{"id":"1"}'
+        with patch.object(converter.requests, "post", return_value=response) as mocked:
             ok, message = converter.verify_grok_credentials(sample_credentials())
 
         self.assertTrue(ok)
         self.assertIn("200", message)
+        self.assertIn("/responses", mocked.call_args.args[0])
         kwargs = mocked.call_args.kwargs
-        self.assertIn("/models", mocked.call_args.args[0])
         self.assertEqual(kwargs["headers"]["x-grok-client-version"], "0.2.93")
         self.assertEqual(kwargs["headers"]["X-XAI-Token-Auth"], "xai-grok-cli")
+
+    def test_verify_grok_chat_classifies_402_and_403(self):
+        self.assertEqual(
+            converter.classify_grok_chat_status(
+                402, '{"code":"personal-team-blocked:spending-limit"}'
+            ),
+            converter.VERDICT_HOLD_402,
+        )
+        self.assertEqual(
+            converter.classify_grok_chat_status(
+                403, '{"code":"permission-denied","error":"Access to the chat endpoint is denied."}'
+            ),
+            converter.VERDICT_DROP_403,
+        )
 
     def test_verify_grok_credentials_rejects_401(self):
         response = MagicMock()
         response.status_code = 401
         response.text = "unauthorized"
-        with patch.object(converter.requests, "get", return_value=response):
+        with patch.object(converter.requests, "post", return_value=response):
             ok, message = converter.verify_grok_credentials(sample_credentials())
 
         self.assertFalse(ok)
