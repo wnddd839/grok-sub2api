@@ -236,11 +236,11 @@ def wait_for_code(
             msg_id = msg.get("id") or msg.get("msgid")
             if not msg_id or msg_id in seen_ids:
                 continue
-            seen_ids.add(msg_id)
             recipients = [t.get("address", "").lower() for t in (msg.get("to") or [])]
             if email.lower() not in recipients:
                 # mail.tm 部分列表项 to 为空，仍尝试读详情
                 if recipients:
+                    seen_ids.add(msg_id)
                     continue
             try:
                 detail = get_message_detail(http_get, base_url, token, msg_id)
@@ -248,6 +248,7 @@ def wait_for_code(
                 if log_callback:
                     log_callback(f"[Debug] 获取邮件详情失败: {exc}")
                 continue
+            seen_ids.add(msg_id)
             parts = []
             text_body = detail.get("text") or ""
             if text_body:

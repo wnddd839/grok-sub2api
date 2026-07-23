@@ -185,9 +185,9 @@ def wait_for_code(
             msg_id = msg.get("id")
             if not msg_id or msg_id in seen_ids:
                 continue
-            seen_ids.add(msg_id)
             to_addrs = [t.get("address", "").lower() for t in (msg.get("to") or [])]
-            if address.lower() not in to_addrs:
+            if to_addrs and address.lower() not in to_addrs:
+                seen_ids.add(msg_id)
                 continue
             try:
                 detail = get_message_detail(http_get, msg_id, token=token, jwt=jwt)
@@ -195,6 +195,7 @@ def wait_for_code(
                 if log_callback:
                     log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
                 continue
+            seen_ids.add(msg_id)
             parts = []
             text_body = detail.get("text") or ""
             if text_body:
