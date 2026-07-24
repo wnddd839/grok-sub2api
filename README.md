@@ -5,8 +5,9 @@
 批量注册 Grok 账号，自动导出为 [Sub2API](https://github.com/Wei-Shaw/sub2api) 可导入的 OAuth 数据包；也可直出 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 本地 auth，或把已有 Sub2 包离线转成 CPA。
 
 <p>
-  <a href="https://github.com/Git-creat7/grokRegister-cpa/stargazers"><img src="https://img.shields.io/github/stars/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="GitHub stars"></a>
-  <a href="https://github.com/Git-creat7/grokRegister-cpa/network/members"><img src="https://img.shields.io/github/forks/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="GitHub forks"></a>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa"><img src="https://img.shields.io/badge/Based%20on-Git--creat7%2FgrokRegister--cpa-important?logo=github" alt="Based on upstream"></a>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa/stargazers"><img src="https://img.shields.io/github/stars/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="Upstream GitHub stars"></a>
+  <a href="https://github.com/Git-creat7/grokRegister-cpa/network/members"><img src="https://img.shields.io/github/forks/Git-creat7/grokRegister-cpa?style=flat&logo=github" alt="Upstream GitHub forks"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
@@ -15,13 +16,31 @@
   <img src="https://img.shields.io/badge/xAI-Grok-black.svg" alt="Grok">
 </p>
 
-[仓库地址](https://github.com/wnddd839/grok-sub2api) · [Sub2API](https://github.com/Wei-Shaw/sub2api) · [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
+[本仓库](https://github.com/wnddd839/grok-sub2api) · [上游 grokRegister-cpa](https://github.com/Git-creat7/grokRegister-cpa) · [Sub2API](https://github.com/Wei-Shaw/sub2api) · [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 
 </div>
 
 ---
 
+> [!IMPORTANT]
+> **本项目不是从零独立研发的注册机。**  
+> 核心注册流程、协议 HTTP 建号、S/P/C/O 流水线、邮箱接入与大量工程基础，均来自上游  
+> **[Git-creat7/grokRegister-cpa](https://github.com/Git-creat7/grokRegister-cpa)**。  
+> 本仓库只是在上游之上做 **适配与强化**（例如 Sub2API 导出与 `/responses` 验活、PKCE + `referrer=grok-build`、代理池、402 留观 / 403 丢弃等）。  
+> 若本仓库对你有帮助，请优先给上游点 Star、关注上游更新；问题排查也请同时参考上游 README 与 Issue。
+
 > 仅用于自动化流程研究、测试环境验证和个人学习。请遵守目标网站服务条款、当地法律法规与第三方服务限制。
+
+## 致谢与上游
+
+感谢 [Git-creat7](https://github.com/Git-creat7) 及 [grokRegister-cpa](https://github.com/Git-creat7/grokRegister-cpa) 的作者与贡献者。没有上游的持续维护，就不会有本分叉。
+
+| | 链接 |
+|---|---|
+| **上游（请优先关注）** | https://github.com/Git-creat7/grokRegister-cpa |
+| 本分叉 | https://github.com/wnddd839/grok-sub2api |
+
+本分叉相对上游的增量，主要是场景适配与运维向增强，**不宣称替代上游，也不宣称独立完成整套注册能力。**
 
 ## 它做什么
 
@@ -50,7 +69,7 @@ Fetch signup config（进程内缓存）
 - 可选 NSFW：批内**纯 HTTP 后台队列**（不冷启浏览器、不抢 Turnstile 代理）；失败进 `nsfw_pending.txt`，可用 `cmd/retry_pending_nsfw.py` 离线补开
 - 页面卡住重试、验证码失败换邮箱；browser 模式仍支持浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
-- **分叉增强**：保留 Sub2API 批量导出/验活，以及 `proxy_pool` 按出口配额轮换和失败切换
+- **分叉适配（基于上游，非独立研发）**：Sub2API 批量导出与 `/responses` 验活、PKCE + `referrer=grok-build`、`proxy_pool`、402 留观 / 403 丢弃等
 
 ## 环境要求
 
