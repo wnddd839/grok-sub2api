@@ -66,11 +66,15 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
 # consent 提交用的 Next.js Server Action ID（快速路径；失效时再从 consent 页 JS 动态解析）
-NEXT_ACTION_ID = "40b1f238edcd2299db9b5d17c8777cfbab7cc3d889"
+# 2026-07-24: 40b1f238… 已 404；JS 扫描确认 40f70c04… 返回 authorization code
+NEXT_ACTION_ID = "40f70c0441dc4df05d0b05491ce97492ef6e2a247d"
 _working_next_action_id = NEXT_ACTION_ID
 _LEGACY_NEXT_ACTION_IDS = (
+    "40b1f238edcd2299db9b5d17c8777cfbab7cc3d889",
     "401b73e22a5e68737d0037e1aa449fef82cd1b35fb",
 )
+# 运行期 404 的 Next-Action，避免双 O worker 快路径反复毒化
+_invalid_next_action_ids: set[str] = set()
 _NEXT_ACTION_RE = re.compile(
     r'(?:\$ACTION_ID_|next-action["\']?\s*[:=]\s*["\']|["\'])([0-9a-f]{40,44})["\']',
     re.I,
@@ -174,6 +178,8 @@ def verify_grok_chat(
     proxy: str = "",
     timeout: int = 30,
     model: str = CPA_PROBE_MODEL,
+    warmup: bool = False,
+    retries: int = 1,
 ) -> tuple[str, str]:
     """打 /responses 并返回 (verdict, message)。
 
@@ -181,20 +187,38 @@ def verify_grok_chat(
     - hold_402: 额度/风控，保留待复活，勿丢
     - drop_403: 权限拒绝（坏 token/无 referrer），应丢弃或重铸
     - fail: 其它错误
+
+    warmup/retries 对齐 probe_cpa_record：新 token 偶发瞬时 403。
     """
-    status, body = probe_grok_responses(
-        creds, proxy=proxy, timeout=timeout, model=model
-    )
-    verdict = classify_grok_chat_status(status, body)
-    if status is None:
-        return verdict, body or "request_error"
-    detail = f"HTTP {status}"
-    summary = (body or "").strip()
-    if summary:
-        if len(summary) > 180:
-            summary = summary[:180] + "..."
-        detail = f"{detail}: {summary}"
-    return verdict, detail
+    if warmup:
+        time.sleep(3)
+    attempts = max(1, int(retries or 1))
+    last_verdict = VERDICT_FAIL
+    last_detail = "request_error"
+    for attempt in range(attempts):
+        if attempt > 0:
+            time.sleep(4)
+        status, body = probe_grok_responses(
+            creds, proxy=proxy, timeout=timeout, model=model
+        )
+        verdict = classify_grok_chat_status(status, body)
+        if status is None:
+            last_verdict, last_detail = verdict, body or "request_error"
+            continue
+        detail = f"HTTP {status}"
+        summary = (body or "").strip()
+        if summary:
+            if len(summary) > 180:
+                summary = summary[:180] + "..."
+            detail = f"{detail}: {summary}"
+        last_verdict, last_detail = verdict, detail
+        if verdict == VERDICT_ALIVE:
+            return verdict, detail
+        # 仅对 permission-denied 类 403 重试；402/其它错误立即返回
+        if verdict == VERDICT_DROP_403 and attempt + 1 < attempts:
+            continue
+        return verdict, detail
+    return last_verdict, last_detail
 
 
 def probe_grok_responses(
@@ -297,15 +321,52 @@ def _parse_consent_code(body: str) -> str | None:
     return None
 
 
+def _mark_next_action_invalid(action_id: str) -> None:
+    """404 / server action not found：清缓存并拉黑，避免快路径反复撞死 ID。"""
+    global _working_next_action_id
+    aid = str(action_id or "").strip().lower()
+    if not aid:
+        return
+    _invalid_next_action_ids.add(aid)
+    if str(_working_next_action_id or "").strip().lower() == aid:
+        _working_next_action_id = ""
+
+
+def _dead_next_action_ids() -> set[str]:
+    return {x.lower() for x in _LEGACY_NEXT_ACTION_IDS} | set(_invalid_next_action_ids)
+
+
+def _filter_action_ids(action_ids: list[str], *, keep_legacy_last: bool = False) -> list[str]:
+    """去重并丢掉已确认失效的 Next-Action；可选把 legacy 沉底作最后手段。"""
+    dead = _dead_next_action_ids()
+    ordered: list[str] = []
+    legacy_tail: list[str] = []
+    seen: set[str] = set()
+    for raw in action_ids or []:
+        aid = str(raw or "").strip().lower()
+        if len(aid) < 40 or aid in seen:
+            continue
+        seen.add(aid)
+        if aid in dead:
+            if keep_legacy_last and aid in {x.lower() for x in _LEGACY_NEXT_ACTION_IDS}:
+                legacy_tail.append(aid)
+            continue
+        ordered.append(aid)
+    if keep_legacy_last:
+        ordered.extend(legacy_tail)
+    return ordered
+
+
 def _extract_next_action_ids(html: str) -> list[str]:
     """仅从 HTML 文本抽哈希（弱信号；真正 id 多在 JS chunk）。"""
     found: list[str] = []
     seen: set[str] = set()
     text = html or ""
+    dead = _dead_next_action_ids()
 
     def _add(val: str):
         v = (val or "").strip().lower()
-        if len(v) < 40 or v in seen:
+        if len(v) < 40 or v in seen or v in dead:
             return
         seen.add(v)
         found.append(v)
@@ -316,8 +377,9 @@ def _extract_next_action_ids(html: str) -> list[str]:
         _add(m.group(1))
     for m in _NEXT_ACTION_RE.finditer(text):
         _add(m.group(1))
-    if NEXT_ACTION_ID and NEXT_ACTION_ID.lower() not in seen:
-        found.append(NEXT_ACTION_ID.lower())
+    current = str(NEXT_ACTION_ID or "").strip().lower()
+    if current and current not in seen and current not in dead:
+        found.append(current)
     return found
 
 
@@ -396,18 +458,24 @@ def _discover_action_ids_from_js(
     for aid in _extract_next_action_ids(html):
         _add(aid, prefer=False)
 
-    # 过期内置 ID 沉底，避免快速路径反复 404
-    legacy = {x.lower() for x in _LEGACY_NEXT_ACTION_IDS}
+    # 过期/已 404 的 ID 沉底或不进快路径；当前常量仅在未失效时置顶
+    dead = _dead_next_action_ids()
     ordered: list[str] = []
     for group in (allow_near, priority, found):
         for aid in group:
-            if aid in ordered:
+            if aid in ordered or aid in dead:
                 continue
             ordered.append(aid)
-    ordered = [x for x in ordered if x not in legacy] + [x for x in ordered if x in legacy]
     current = str(NEXT_ACTION_ID or "").strip().lower()
-    if current and current not in legacy:
+    if current and current not in dead:
         ordered = [current] + [x for x in ordered if x != current]
+    # legacy 仅作最后兜底（不含运行期 invalid，那些已确认死）
+    legacy_only = {
+        x.lower() for x in _LEGACY_NEXT_ACTION_IDS
+    } - set(_invalid_next_action_ids)
+    for aid in legacy_only:
+        if aid not in ordered:
+            ordered.append(aid)
     if log:
         log(f"  [*] 从 JS chunks 解析 Next-Action {len(ordered)} 个（扫 {fetched} 个脚本）")
     return ordered
@@ -762,11 +830,13 @@ def _sso_to_token_pkce(
         else:
             action_ids = []
             cached = str(_working_next_action_id or "").strip().lower()
-            if cached:
+            dead = _dead_next_action_ids()
+            if cached and cached not in dead:
                 action_ids.append(cached)
             for action_id in _extract_next_action_ids(html):
-                if action_id not in action_ids:
+                if action_id not in action_ids and action_id not in dead:
                     action_ids.append(action_id)
+            action_ids = _filter_action_ids(action_ids)
             log(f"  [*] consent 快速路径 Next-Action {len(action_ids)} 个（跳过 JS chunks 扫描）")
         return resp, url, action_ids
 
@@ -774,8 +844,12 @@ def _sso_to_token_pkce(
     if r is None:
         return None
     if not action_ids:
-        action_ids = [NEXT_ACTION_ID]
-        log(f"  ⚠️ 未解析到 Next-Action，使用 fallback {NEXT_ACTION_ID[:12]}...")
+        fallback = str(NEXT_ACTION_ID or "").strip().lower()
+        if fallback and fallback not in _dead_next_action_ids():
+            action_ids = [fallback]
+            log(f"  ⚠️ 未解析到 Next-Action，使用 fallback {fallback[:12]}...")
+        else:
+            log("  ⚠️ 未解析到可用 Next-Action，将触发 JS 扫描重试")
     else:
         log(f"  [*] consent Next-Action 候选 {len(action_ids)} 个（首个 {action_ids[0][:12]}...）")
 
@@ -805,12 +879,13 @@ def _sso_to_token_pkce(
             if r is None:
                 return None
             if not action_ids:
-                action_ids = [NEXT_ACTION_ID]
+                fallback = str(NEXT_ACTION_ID or "").strip().lower()
+                action_ids = [fallback] if fallback and fallback not in _dead_next_action_ids() else []
 
         for action_id in action_ids[:8]:
             if _cancelled():
                 return None
-            if action_id in tried:
+            if action_id in tried or action_id in _dead_next_action_ids():
                 continue
             tried.add(action_id)
             try:
@@ -836,8 +911,7 @@ def _sso_to_token_pkce(
             if r.status_code == 404 or "server action not found" in body.lower():
                 last_err = f"consent HTTP {r.status_code}: {body[:160]}"
                 log(f"  ⚠️ Next-Action {action_id[:12]}... 无效: {last_err}")
-                if str(_working_next_action_id or "").strip().lower() == action_id:
-                    _working_next_action_id = ""
+                _mark_next_action_invalid(action_id)
                 continue
             if r.status_code < 200 or r.status_code >= 300:
                 last_err = f"consent HTTP {r.status_code}: {body[:200]}"
@@ -846,6 +920,8 @@ def _sso_to_token_pkce(
             code = _parse_consent_code(body)
             if code:
                 _working_next_action_id = action_id
+                # 成功则从 invalid 摘掉（防御误伤）
+                _invalid_next_action_ids.discard(action_id)
                 log(f"  [*] Next-Action {action_id[:12]}... 返回 authorization code")
                 break
             last_err = f"consent 未返回 code: {body[:180]}"
@@ -910,6 +986,8 @@ def _sso_to_token_pkce(
         log(f"  ✅ access_token referrer={ref!r}")
     log(
         f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+        f" scope={ap.get('scope')!r} referrer={ref!r}"
+        f" bot_flag={ap.get('bot_flag')!r} bot={ap.get('bot_flag_source')!r}"
         + (" + refresh_token" if token.get("refresh_token") else "")
     )
     return token

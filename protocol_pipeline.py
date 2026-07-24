@@ -88,13 +88,21 @@ class PipelineStats:
 
 
 def derive_workers(
-    target: int, register_workers: int = 1
+    target: int,
+    register_workers: int = 1,
+    mint_browsers: int = 1,
 ) -> Tuple[int, int, int, int, int]:
-    """返回 (s, p, c, o, phys_mint)。Turnstile 浏览器默认 phys=1。"""
+    """返回 (s, p, c, o, phys_mint)。
+
+    phys_mint：同时开几个 Chrome 铸 Turnstile。默认 1（稳）；可提到 2～3 换吞吐，
+    CF 风控变严时再降回 1。S 线程数与 phys 对齐，否则多余槽位用不上。
+    """
     target = max(1, int(target or 1))
     rw = max(1, min(int(register_workers or 1), 8))
-    s = 1
-    phys = 1
+    phys = max(1, min(int(mint_browsers or 1), 4))
+    if target == 1:
+        phys = 1
+    s = phys
     p = min(4, max(1, min(target, rw + 1)))
     c = min(2, max(1, target // 2 or 1))
     o = min(2, max(1, min(target, rw)))
@@ -115,6 +123,7 @@ class ProtocolPipeline:
         log: LogFn = None,
         should_stop: StopFn = None,
         register_workers: int = 1,
+        mint_browsers: int = 1,
         token_ttl: float = 240.0,
         q_ttl: float = 120.0,
     ):
@@ -128,7 +137,7 @@ class ProtocolPipeline:
         self.token_ttl = max(60.0, float(token_ttl))
         self.q_ttl = max(30.0, float(q_ttl))
         self.s_n, self.p_n, self.c_n, self.o_n, self.phys = derive_workers(
-            self.target, register_workers
+            self.target, register_workers, mint_browsers=mint_browsers
         )
         self.stats = PipelineStats()
         self._t_q: queue.Queue = queue.Queue(maxsize=max(2, min(6, self.target)))

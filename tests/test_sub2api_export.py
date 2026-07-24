@@ -140,6 +140,26 @@ class Sub2APIExportTests(unittest.TestCase):
             converter.VERDICT_DROP_403,
         )
 
+    def test_verify_grok_chat_retries_transient_403(self):
+        responses = [
+            (403, '{"code":"permission-denied","error":"Access to the chat endpoint is denied."}'),
+            (403, '{"code":"permission-denied","error":"Access to the chat endpoint is denied."}'),
+            (200, '{"id":"ok"}'),
+        ]
+
+        def _probe(*args, **kwargs):
+            return responses.pop(0)
+
+        with patch.object(converter, "probe_grok_responses", side_effect=_probe), patch.object(
+            converter.time, "sleep", return_value=None
+        ):
+            verdict, message = converter.verify_grok_chat(
+                sample_credentials(), warmup=True, retries=3
+            )
+        self.assertEqual(verdict, converter.VERDICT_ALIVE)
+        self.assertIn("200", message)
+        self.assertEqual(responses, [])
+
     def test_verify_grok_credentials_rejects_401(self):
         response = MagicMock()
         response.status_code = 401

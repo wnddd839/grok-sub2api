@@ -122,9 +122,18 @@ class PipelineDeriveTests(unittest.TestCase):
         self.assertGreaterEqual(c, 1)
         self.assertGreaterEqual(o, 1)
 
+    def test_derive_workers_multi_mint(self):
+        s, p, c, o, phys = pp.derive_workers(
+            10, register_workers=4, mint_browsers=3
+        )
+        self.assertEqual(phys, 3)
+        self.assertEqual(s, 3)
+
     def test_derive_workers_single(self):
-        s, p, c, o, phys = pp.derive_workers(1, register_workers=1)
+        s, p, c, o, phys = pp.derive_workers(1, register_workers=1, mint_browsers=3)
         self.assertEqual((p, c, o), (1, 1, 1))
+        self.assertEqual(phys, 1)
+        self.assertEqual(s, 1)
 
 
 if __name__ == "__main__":

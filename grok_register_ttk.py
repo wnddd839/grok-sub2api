@@ -188,6 +188,8 @@ DEFAULT_CONFIG = {
     "log_level": "info",
     "register_count": 1,
     "register_workers": 1,
+    # 协议模式同时铸 Turnstile 的 Chrome 数（1 稳；2～3 更快，CF 紧了再降）
+    "protocol_mint_browsers": 2,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后自动走 Device Flow 换 token 并写成 CPA 扁平格式
     "cpa_auto_add": True,
@@ -1033,11 +1035,20 @@ def run_protocol_pipeline_batch(
     should_stop=None,
     on_account=None,
     register_workers=1,
+    mint_browsers=None,
 ):
     """跑协议 S/P/C/O 流水线。on_account(email, password, sso, profile) 在 O 阶段调用。"""
     proxy = _resolve_cpa_proxy()
+    if mint_browsers is None:
+        try:
+            mint_browsers = int(config.get("protocol_mint_browsers", 2) or 2)
+        except Exception:
+            mint_browsers = 2
+    mint_browsers = max(1, min(int(mint_browsers or 1), 4))
     if log_callback:
-        log_callback("[*] 注册模式: protocol pipeline（S/P/C/O）")
+        log_callback(
+            f"[*] 注册模式: protocol pipeline（S/P/C/O），Turnstile Chrome×{mint_browsers}"
+        )
 
     def _on_sso(email, password, sso, profile):
         if on_account:
@@ -1059,6 +1070,7 @@ def run_protocol_pipeline_batch(
         log=log_callback,
         should_stop=should_stop,
         register_workers=register_workers,
+        mint_browsers=mint_browsers,
     )
     return pipe.run()
 
@@ -1322,8 +1334,9 @@ def add_sso_to_sub2api(raw_token, email="", password="", log_callback=None, shou
             )
             if payload["verify_enabled"]:
                 _s2_log(f"{label}: /responses 验活中 ...")
+                # 对齐 CPA probe：新 token 偶发瞬时 403，warmup+retry
                 verdict, message = _s2cpa.verify_grok_chat(
-                    creds, proxy=payload["proxy"]
+                    creds, proxy=payload["proxy"], warmup=True, retries=3
                 )
                 if verdict == _s2cpa.VERDICT_DROP_403 and used_flow == "device":
                     _s2_log(f"{label}: Device token 403，改用 PKCE 重铸一次 ...")
@@ -1340,7 +1353,7 @@ def add_sso_to_sub2api(raw_token, email="", password="", log_callback=None, shou
                             token, email=payload["email"]
                         )
                         verdict, message = _s2cpa.verify_grok_chat(
-                            creds, proxy=payload["proxy"]
+                            creds, proxy=payload["proxy"], warmup=True, retries=3
                         )
                     else:
                         verdict, message = _s2cpa.VERDICT_DROP_403, message

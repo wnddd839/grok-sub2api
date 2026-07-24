@@ -10,6 +10,10 @@ import sso_to_auth_json as s2a
 
 
 class ExtractNextActionTests(unittest.TestCase):
+    def setUp(self):
+        s2a._invalid_next_action_ids.clear()
+        s2a._working_next_action_id = s2a.NEXT_ACTION_ID
+
     def test_sso_to_token_honors_pre_cancel_without_network(self):
         with patch.object(
             s2a.requests,
@@ -244,13 +248,48 @@ class ExtractNextActionTests(unittest.TestCase):
         self.assertEqual(result["skipped"], 0)
 
     def test_extract_create_server_reference(self):
-        html = 'createServerReference("401b73e22a5e68737d0037e1aa449fef82cd1b35fb", callServer)'
+        html = 'createServerReference("40abcdef01234567890123456789012345678901", callServer)'
         ids = s2a._extract_next_action_ids(html)
-        self.assertTrue(any(x.startswith("401b73e2") for x in ids))
+        self.assertTrue(any(x.startswith("40abcdef0123") for x in ids))
+        # legacy / invalid 不应再进入候选
+        legacy_html = 'createServerReference("401b73e22a5e68737d0037e1aa449fef82cd1b35fb", callServer)'
+        legacy_ids = s2a._extract_next_action_ids(legacy_html)
+        self.assertFalse(any(x.startswith("401b73e2") for x in legacy_ids))
 
     def test_fallback_includes_hardcoded(self):
         ids = s2a._extract_next_action_ids("")
         self.assertIn(s2a.NEXT_ACTION_ID.lower(), [x.lower() for x in ids])
+
+    def test_404_marks_invalid_and_skips_dead_constant(self):
+        dead = "40b1f238edcd2299db9b5d17c8777cfbab7cc3d889"
+        s2a._working_next_action_id = dead
+        s2a._mark_next_action_invalid(dead)
+        self.assertEqual(s2a._working_next_action_id, "")
+        self.assertIn(dead, s2a._invalid_next_action_ids)
+        ids = s2a._extract_next_action_ids(
+            f'createServerReference("{dead}", callServer)'
+        )
+        self.assertNotIn(dead, ids)
+        self.assertIn(s2a.NEXT_ACTION_ID.lower(), ids)
+
+    def test_discover_does_not_prefer_legacy_constant(self):
+        class FakeResponse:
+            text = (
+                'createServerReference("40f70c0441dc4df05d0b05491ce97492ef6e2a247d", callServer);'
+                'allow'
+            )
+
+        class FakeSession:
+            def get(self, url, **kwargs):
+                return FakeResponse()
+
+        html = '<script src="/_next/static/chunks/consent-oauth.js"></script>'
+        # 即使把过期 ID 塞进 HTML，也不应置顶
+        html += 'createServerReference("40b1f238edcd2299db9b5d17c8777cfbab7cc3d889", callServer)'
+        ids = s2a._discover_action_ids_from_js(FakeSession(), html, log=None)
+        self.assertTrue(ids)
+        self.assertEqual(ids[0], s2a.NEXT_ACTION_ID.lower())
+        self.assertNotEqual(ids[0], "40b1f238edcd2299db9b5d17c8777cfbab7cc3d889")
 
     def test_parse_consent_code(self):
         body = (
@@ -381,7 +420,9 @@ class ExtractNextActionTests(unittest.TestCase):
                 if "/oauth2/authorize" in url:
                     return FakeResponse(
                         "https://accounts.x.ai/oauth2/consent?state=x",
-                        text='createServerReference("40b1f238edcd2299db9b5d17c8777cfbab7cc3d889", callServer)',
+                        text=(
+                            f'createServerReference("{s2a.NEXT_ACTION_ID}", callServer)'
+                        ),
                     )
                 return FakeResponse(url)
 
